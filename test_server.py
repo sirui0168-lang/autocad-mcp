@@ -38,7 +38,7 @@ def main() -> int:
     print("AutoCAD MCP Server Self-Test (v1.1.0)")
     print("=" * 68)
 
-    out_dir = Path.home() / "Documents" / "AutoCAD_MCP"
+    out_dir = server._output_dir  # honours AUTOCAD_MCP_OUTPUT
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── 1. lifecycle ──────────────────────────────────────────────────────
