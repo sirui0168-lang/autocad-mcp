@@ -101,7 +101,7 @@ after every deletion, handles do not.
 | `list_entities` / `delete_entity` | Inspect and delete (prefer `handle=`) |
 | `calculate_area` / `get_drawing_extents` | Measurements |
 | `export_svg` | SVG (native renderer, fast, no matplotlib needed) |
-| `export_png` | PNG (matplotlib) |
+| `export_png` | PNG (SVG rasterised by PyMuPDF; matplotlib fallback) |
 
 ## Floor plan conventions
 
@@ -120,3 +120,11 @@ Files go to `~/Documents/AutoCAD_MCP/` by default (`AUTOCAD_MCP_OUTPUT`
 overrides it). `save_drawing` / `finish` / `export_*` accept `file_path` for an
 explicit location. Unsaved changes are also auto-saved on shutdown to
 `<output>/.autosave/<name>.dxf`.
+
+## Tool modes
+
+`AUTOCAD_MCP_TOOLS=core` exposes only 9 tools (`new_drawing`, `open_drawing`,
+`save_drawing`, `close_drawing`, `list_drawings`, `apply_ops`, `finish`,
+`inspect_drawing`, `view_drawing`) — ~550 schema tokens instead of ~3 400.
+Set it in the MCP server env when the schema cost per turn matters; `full` is
+the default.

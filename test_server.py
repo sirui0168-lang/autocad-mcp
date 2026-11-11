@@ -10,7 +10,10 @@ Usage:
 """
 
 import json
+import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 # Ensure plugin dir is on path
@@ -35,7 +38,7 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 def main() -> int:
     print("=" * 68)
-    print("AutoCAD MCP Server Self-Test (v1.2.0)")
+    print("AutoCAD MCP Server Self-Test (v1.3.0)")
     print("=" * 68)
 
     out_dir = server._output_dir  # honours AUTOCAD_MCP_OUTPUT
@@ -169,6 +172,20 @@ def main() -> int:
     check("export_png", "PNG" in server.export_png("test_run", str(out_dir / "test_run.png"), dpi=120))
     img = server.view_drawing("test_run")
     check("view_drawing returns Image", type(img).__name__ == "Image", type(img).__name__)
+
+    # PNG path: PyMuPDF rasterises the SVG; matplotlib is only the fallback.
+    if server._PNG_MODE != "matplotlib" and server._get_png_backend() is not None:
+        png_path = out_dir / "test_mupdf.png"
+        t0 = time.perf_counter()
+        server._render_png(server._drawings["test_run"], png_path, dpi=120)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        size = png_path.stat().st_size if png_path.exists() else 0
+        check(
+            "PNG rasterised by MuPDF",
+            size > 1000 and png_path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n",
+            f"{size} B",
+        )
+        check("MuPDF PNG under 1.5 s", elapsed_ms < 1500, f"{elapsed_ms:.0f} ms")
     res = server.finish("test_run", save=True, svg=True, png=False)
     check("finish writes both files", "DXF →" in res and "SVG →" in res, res)
 
@@ -176,8 +193,29 @@ def main() -> int:
     print("\n[12] output dir")
     check("no literal ~ in output dir", "~" not in str(server._output_dir), str(server._output_dir))
 
-    # ── 13. cleanup ──────────────────────────────────────────────────────
-    print("\n[13] cleanup")
+    # ── 13. core tool mode ───────────────────────────────────────────────
+    print("\n[13] core tool mode")
+    probe = "import server; print(len(server.mcp._tool_manager._tools))"
+    base_env = dict(os.environ, AUTOCAD_MCP_WARM="0")
+    core_run = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=plugin_dir,
+        env=dict(base_env, AUTOCAD_MCP_TOOLS="core"),
+        capture_output=True,
+        text=True,
+    )
+    full_run = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=plugin_dir,
+        env=dict(base_env, AUTOCAD_MCP_TOOLS="full"),
+        capture_output=True,
+        text=True,
+    )
+    check("core mode exposes 9 tools", core_run.stdout.strip() == "9", core_run.stdout.strip() + core_run.stderr[-300:])
+    check("full mode exposes 38 tools", full_run.stdout.strip() == "38", full_run.stdout.strip() + full_run.stderr[-300:])
+
+    # ── 14. cleanup ──────────────────────────────────────────────────────
+    print("\n[14] cleanup")
     check("close_drawing", "Closed" in server.close_drawing("test_run"))
     check("closed drawing gone", "test_run" not in server._drawings)
 

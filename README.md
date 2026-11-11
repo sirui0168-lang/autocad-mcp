@@ -35,7 +35,7 @@ autocad-mcp/
 ├── server.py                  # MCP Server 主入口（FastMCP，38 项工具）
 ├── test_server.py             # 一键自检（36 项端到端检查）
 ├── benchmark.py               # 性能基准（启动、导出、并发、大图）
-├── requirements.txt           # Python 依赖清单 (ezdxf, matplotlib, mcp)
+├── requirements.txt           # Python 依赖清单 (ezdxf, pymupdf, mcp)
 ├── plugin.json                # Antigravity / Agent 插件元数据清单
 ├── mcp_config.json            # MCP 配置文件示例
 ├── rules/
@@ -68,8 +68,13 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-> `matplotlib` 只在导出 PNG / 内联预览时用到；只画 DXF + SVG 的话可以省掉它。
-> 不装 `matplotlib` 时 `export_svg` 依然可用（原生渲染器，不需要 matplotlib）。
+> PNG 导出走 **PyMuPDF**：先把图纸渲染成 SVG（ezdxf 原生后端），内联掉 ezdxf 的
+> CSS 类（MuPDF 不认 `<style>`，不内联会整幅变黑），再交给 MuPDF 光栅化。
+> 同一张 11.7 MB、2.9 万个实体（含 8 千文本、9 千图块）的污水管网图：matplotlib
+> 23.2 s → **6.7 s**；普通平立剖图 5–25 ms。再快就得上 LOD（按屏幕像素丢弃不可见文本），
+> 那是另一个量级的工程，暂不做。
+> `matplotlib` 只在没装 PyMuPDF 时才作为回退路径使用，两者都没有时 PNG 不可用，
+> `export_svg` / `finish(svg=True)` 不受影响。
 
 ---
 
@@ -105,7 +110,9 @@ pip install -r requirements.txt
       "args": ["/绝对路径/autocad-mcp/server.py"],
       "env": {
         "AUTOCAD_MCP_OUTPUT": "~/Documents/AutoCAD_MCP",
-        "AUTOCAD_MCP_LOG": "WARNING"
+        "AUTOCAD_MCP_LOG": "WARNING",
+        "AUTOCAD_MCP_TOOLS": "full",
+        "AUTOCAD_MCP_PNG": "auto"
       }
     }
   }
@@ -251,7 +258,7 @@ apply_ops(drawing="plan", ops=[ ... 全部图元 ... ], finish=True)
 | 工具名称 | 功能描述 | 核心参数 |
 | :--- | :--- | :--- |
 | `export_svg` | 导出矢量图 (.svg)，**原生渲染器，不需要 matplotlib** | `drawing`, `file_path` |
-| `export_png` | 导出光栅图 (.png)，需 matplotlib（大图较慢，优先用 SVG） | `drawing`, `file_path`, `dpi` |
+| `export_png` | 导出光栅图 (.png)：SVG 经 PyMuPDF 光栅化，未装时回退 matplotlib | `drawing`, `file_path`, `dpi` |
 
 ---
 
@@ -275,9 +282,11 @@ apply_ops(drawing="plan", ops=[ ... 全部图元 ... ], finish=True)
 | :--- | :--- | :--- |
 | `AUTOCAD_MCP_OUTPUT` | `~/Documents/AutoCAD_MCP` | 默认输出目录，支持 `~` 展开 |
 | `AUTOCAD_MCP_LOG` | `WARNING` | 日志级别；调试时设 `INFO` / `DEBUG` |
-| `AUTOCAD_MCP_WARM` | `1` | 启动时后台预热 matplotlib 字体缓存；设 `0` 关闭 |
+| `AUTOCAD_MCP_TOOLS` | `full` | `full` = 暴露全部 38 个工具；`core` = 只暴露 9 个复合工具（见下） |
+| `AUTOCAD_MCP_PNG` | `auto` | `auto` = 有 PyMuPDF 就用它；`mupdf` / `matplotlib` 强制指定后端 |
+| `AUTOCAD_MCP_WARM` | `1` | 启动时后台预热渲染器（SVG 后端；回退 matplotlib 时还有字体缓存）；设 `0` 关闭 |
 
-- **导出很慢 / 卡住**：用 `export_svg`（原生渲染器，5 万图元约 0.75 s）代替 `export_png`；PNG 走 matplotlib，大图会到秒级。
+- **导出很慢 / 卡住**：v1.3.0 起 PNG 走 PyMuPDF（先 SVG 再光栅化），11.7 MB 文本密集的图约 6.7 s（matplotlib 是 23 s）；普通图毫秒级。仍嫌慢就查 `AUTOCAD_MCP_PNG`：`matplotlib` 会走回退老路，`mupdf` 强制新路。文本极多的超大图本身就要数秒——ezdxf 得把每个文字转成字形轮廓。
 - **调用期间整个服务器假死**：v1.1.0 已修——所有工具在工作线程执行，长任务改用共享锁，导出进行中 `list_drawings` 约 0.5 ms。
 - **重启后图纸丢了**：服务器退出时会自动把改动过的图纸存到 `<输出目录>/.autosave/<name>.dxf`，用 `open_drawing` 找回。
 - **stderr 满屏日志**：默认已静音，需要时用 `AUTOCAD_MCP_LOG=INFO` 打开。

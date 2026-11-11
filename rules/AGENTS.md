@@ -24,8 +24,9 @@ When the user asks to create or edit CAD drawings:
 - Use standard ACI colors for layers: 1=red, 2=yellow, 3=green, 4=cyan, 5=blue, 6=magenta, 7=white.
 - Always `finish` (or `save_drawing`) when the user's request is complete.
 - Offer a preview (`finish` exports SVG; `view_drawing` shows it inline).
-- Prefer `export_svg` over `export_png`: SVG uses the native renderer and is
-  ~10× faster; PNG goes through matplotlib and is slow on large drawings.
+- Prefer `export_svg` over `export_png`: SVG is vector, smaller and faster. PNG
+  is SVG rasterised by PyMuPDF (matplotlib only as a fallback) — milliseconds
+  for a plan, seconds for a huge text-heavy drawing.
 - The output directory is `~/Documents/AutoCAD_MCP/` by default (`AUTOCAD_MCP_OUTPUT` overrides).
 - Generated DXF files can be opened directly in AutoCAD 2025 or any DXF-compatible software.
 
@@ -36,3 +37,5 @@ When the user asks to create or edit CAD drawings:
 - `add_hatch`: omit `color` for BYLAYER; `color=0` means black.
 - `draw_polyline` accepts `is_closed` as an alias of `closed`.
 - Restart-safe: unsaved drawings are auto-saved on shutdown to `<output>/.autosave/<name>.dxf`.
+- `AUTOCAD_MCP_TOOLS=core` trims the tool list to 9 composite tools (smaller
+  schema per request); `AUTOCAD_MCP_PNG=matplotlib` forces the old PNG path.

@@ -1,4 +1,7 @@
 ezdxf>=1.4.0
 mcp>=1.3.0,<2
-# Optional: only needed for PNG export / inline preview (export_svg does not use it)
+# Fast PNG export / inline preview: rasterises the SVG in well under a second.
+# Optional — without it PNG falls back to matplotlib.
+pymupdf>=1.24
+# Optional fallback rasteriser, only used when PyMuPDF is not installed.
 matplotlib>=3.8.0

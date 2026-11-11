@@ -24,6 +24,7 @@ import json
 import logging
 import math
 import os
+import re
 import signal
 import threading
 from contextlib import contextmanager
@@ -46,6 +47,13 @@ from mcp.server.fastmcp import FastMCP, Image
 _LOG_LEVEL = os.environ.get("AUTOCAD_MCP_LOG", "WARNING").upper()
 for _logger_name in ("mcp", "ezdxf", "matplotlib", "httpx"):
     logging.getLogger(_logger_name).setLevel(_LOG_LEVEL)
+
+# Tool surface: "full" exposes all 38 tools, "core" only the ~9 composite ones.
+# Every schema is re-sent on every request, so core mode saves ~2.4 K tokens.
+_TOOL_MODE = os.environ.get("AUTOCAD_MCP_TOOLS", "full").strip().lower()
+
+# PNG rasteriser: auto (PyMuPDF when installed) | mupdf | matplotlib.
+_PNG_MODE = os.environ.get("AUTOCAD_MCP_PNG", "auto").strip().lower()
 
 # ---------------------------------------------------------------------------
 # Server state
@@ -147,6 +155,10 @@ def _get_drawing(name: str) -> Drawing:
 
 def _touch(name: str) -> None:
     _dirty.add(name)
+    doc = _drawings.get(name)
+    if doc is not None:
+        key = id(doc)
+        _edit_serial[key] = _edit_serial.get(key, 0) + 1
 
 
 # ---------------------------------------------------------------------------
@@ -154,11 +166,20 @@ def _touch(name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def tool(fn: Callable[..., Any] | None = None, *, readonly: bool = False):
+def tool(
+    fn: Callable[..., Any] | None = None,
+    *,
+    readonly: bool = False,
+    core: bool = False,
+):
     """Register a function as an MCP tool.
 
     The call runs in a worker thread so it never blocks the event loop, under
     a shared lock (readonly=True) or an exclusive lock (mutating tools).
+
+    core=True marks the tool as part of the small "core" toolset exposed when
+    AUTOCAD_MCP_TOOLS=core — every tool schema is re-sent to the model on
+    every request, so a 9-tool surface saves thousands of tokens per turn.
 
     The decorated module-level name still resolves to the original *sync*
     function, so `server.draw_line(...)` keeps working from scripts and tests.
@@ -183,7 +204,8 @@ def tool(fn: Callable[..., Any] | None = None, *, readonly: bool = False):
             return await anyio.to_thread.run_sync(_run)
 
         _call.__signature__ = sig  # type: ignore[attr-defined]
-        mcp.tool()(_call)
+        if _TOOL_MODE != "core" or core:
+            mcp.tool()(_call)
         return func
 
     return register(fn) if fn is not None else register
@@ -445,7 +467,7 @@ def _describe_entity(index: int, entity) -> str:
 # ── Drawing lifecycle ──────────────────────────────────────────────────────
 
 
-@tool
+@tool(core=True)
 def new_drawing(name: str, dxf_version: str = "R2018") -> str:
     """Create a new empty DXF drawing in memory.
 
@@ -462,7 +484,7 @@ def new_drawing(name: str, dxf_version: str = "R2018") -> str:
     return f"✅ Created new drawing '{name}' (DXF {dxf_version})."
 
 
-@tool
+@tool(core=True)
 def open_drawing(name: str, file_path: str) -> str:
     """Open an existing DXF file from disk.
 
@@ -484,7 +506,7 @@ def open_drawing(name: str, file_path: str) -> str:
     return f"✅ Opened '{path.name}' as '{name}'."
 
 
-@tool(readonly=True)
+@tool(readonly=True, core=True)
 def save_drawing(drawing: str = "", file_path: str = "", name: str = "") -> str:
     """Save the drawing to a DXF file.
 
@@ -505,7 +527,7 @@ def save_drawing(drawing: str = "", file_path: str = "", name: str = "") -> str:
     return f"✅ Saved '{target}' → {path}"
 
 
-@tool
+@tool(core=True)
 def close_drawing(name: str) -> str:
     """Close a drawing and remove it from memory (does NOT auto-save).
 
@@ -520,7 +542,7 @@ def close_drawing(name: str) -> str:
     return f"✅ Closed drawing '{name}'."
 
 
-@tool(readonly=True)
+@tool(readonly=True, core=True)
 def list_drawings() -> str:
     """List all currently open drawings."""
     if not _drawings:
@@ -1165,8 +1187,95 @@ def set_units(drawing: str, units: str = "millimeters") -> str:
 # ── Export / Render ────────────────────────────────────────────────────────
 
 
-def _render_svg(doc: Drawing, path: Path) -> None:
-    """Native ezdxf SVG backend: ~8x faster than matplotlib, no font cache."""
+_edit_serial: dict[int, int] = {}
+_page_cache: dict[int, tuple[int, int, Page]] = {}
+
+
+def _fit_page(doc: Drawing, long_edge_mm: float = 297.0) -> Page:
+    """Page size (mm) matching the drawing's aspect ratio.
+
+    ezdxf's Page(0, 0) auto-fit treats drawing units as millimetres, so a 10 m
+    plan becomes a 10.9 mm page — fine for a browser (it scales the viewBox),
+    but a 150 dpi raster of it is only ~60 px wide. Fitting the long edge to
+    A4 landscape keeps SVG embeds and PNG previews at a sane physical size.
+
+    The extents walk is cached per document/entity-count: on a 29 000 entity
+    drawing it costs ~3 s, which dwarfs the render itself.
+    """
+    key = id(doc)
+    count = len(doc.modelspace())
+    serial = _edit_serial.get(key, 0)
+    hit = _page_cache.get(key)
+    if hit is not None and hit[0] == count and hit[1] == serial:
+        return hit[2]
+
+    w = h = 0.0
+    if serial == 0:
+        # Untouched file: the header extents are exact and free (a 29 000
+        # entity walk costs seconds, the header costs microseconds).
+        try:
+            lo = doc.header.get("$EXTMIN", (0.0, 0.0, 0.0))
+            hi = doc.header.get("$EXTMAX", (0.0, 0.0, 0.0))
+            w, h = float(hi[0]) - float(lo[0]), float(hi[1]) - float(lo[1])
+        except Exception:
+            w = h = 0.0
+        if not (0.0 < w < 1e12 and 0.0 < h < 1e12):
+            w = h = 0.0
+    if w <= 0 or h <= 0:
+        try:
+            ext = ezdxf_bbox.extents(doc.modelspace(), fast=True)
+            size = ext.extmax - ext.extmin
+            w, h = float(size.x), float(size.y)
+        except Exception:
+            w = h = 0.0
+    if w <= 0 or h <= 0:
+        page = Page(297.0, 210.0)
+    else:
+        scale = long_edge_mm / max(w, h)
+        page = Page(w * scale, h * scale)
+    _page_cache[key] = (count, serial, page)
+    return page
+
+
+_SVG_STYLE_RE = re.compile(r"<style>\.(C\d+) \{([^}]*)\}</style>")
+_SVG_CLASS_RE = re.compile(r'class="(C\d+)"')
+
+
+def _inline_svg_css(svg_text: str) -> str:
+    """Rewrite ezdxf's CSS classes into presentation attributes.
+
+    ezdxf emits `<style>.C1 {stroke: #ff0000; ...}</style>` plus
+    `<path class="C1">`. Browsers are happy, but MuPDF's SVG parser ignores
+    stylesheets and paints everything black with a 1-unit stroke — inlining is
+    what makes the raster path usable.
+    """
+    rules: dict[str, str] = {}
+    for cls, decls in _SVG_STYLE_RE.findall(svg_text):
+        attrs = []
+        for decl in decls.split(";"):
+            if ":" not in decl:
+                continue
+            name, value = decl.split(":", 1)
+            name, value = name.strip(), value.strip()
+            if not name or not value:
+                continue
+            attrs.append(f'{name}="{value}"')
+        rules[cls] = " ".join(attrs)
+    if not rules:
+        return svg_text
+
+    def repl(match: "re.Match[str]") -> str:
+        return rules.get(match.group(1), match.group(0))
+
+    return _SVG_CLASS_RE.sub(repl, svg_text)
+
+
+def _svg_string(doc: Drawing, *, inline_css: bool = False) -> str:
+    """Render the modelspace to an SVG document string.
+
+    Native ezdxf backend: ~8x faster than matplotlib and no font cache, so it
+    is also the source for PNG (rasterised by MuPDF when available).
+    """
     if len(doc.modelspace()) == 0:
         raise ValueError("drawing is empty — nothing to render")
     backend = svg.SVGBackend()
@@ -1174,10 +1283,64 @@ def _render_svg(doc: Drawing, path: Path) -> None:
     Frontend(RenderContext(doc), backend, config=config).draw_layout(
         doc.modelspace(), finalize=True
     )
-    path.write_text(backend.get_string(Page(0, 0)), encoding="utf-8")
+    text = backend.get_string(_fit_page(doc))
+    return _inline_svg_css(text) if inline_css else text
 
 
-def _render_png(doc: Drawing, path: Path, dpi: int = 150) -> None:
+def _render_svg(doc: Drawing, path: Path) -> None:
+    path.write_text(_svg_string(doc), encoding="utf-8")
+
+
+_png_backend: Any = None
+_png_backend_checked = False
+_png_backend_lock = threading.Lock()
+
+
+def _get_png_backend() -> Any:
+    """PyMuPDF module, or None when it cannot be used.
+
+    Guarded: the warm-up thread and the first real request can reach this
+    simultaneously, and a half-initialised module would otherwise be cached as
+    "unavailable" for the rest of the process (silently dropping PNG back to
+    matplotlib, i.e. ~4x slower).
+    """
+    global _png_backend, _png_backend_checked
+    if _png_backend_checked:
+        return _png_backend
+    with _png_backend_lock:
+        if not _png_backend_checked:
+            try:
+                from ezdxf.addons.drawing import pymupdf as ezdxf_pymupdf
+
+                # ezdxf exposes this as a module-level bool in some versions
+                installed = ezdxf_pymupdf.is_pymupdf_installed
+                if installed() if callable(installed) else installed:
+                    _png_backend = ezdxf_pymupdf.pymupdf
+                _png_backend_checked = True
+            except ImportError:
+                _png_backend_checked = True  # genuinely not installed
+            except Exception:
+                pass  # transient (concurrent import) — try again next time
+    return _png_backend
+
+
+def _png_via_mupdf(doc: Drawing, path: Path, dpi: int) -> bool:
+    """Rasterise the SVG with MuPDF. False when PyMuPDF is not installed."""
+    mod = _get_png_backend()
+    if mod is None:
+        return False
+    svg_text = _svg_string(doc, inline_css=True)
+    pdf = mod.open(stream=svg_text.encode("utf-8"), filetype="svg")
+    try:
+        pix = pdf[0].get_pixmap(dpi=int(dpi), alpha=False)
+        pix.save(str(path))
+    finally:
+        pdf.close()
+    return True
+
+
+def _png_via_matplotlib(doc: Drawing, path: Path, dpi: int) -> None:
+    """Legacy path: ezdxf's matplotlib backend, kept as the fallback."""
     import matplotlib
 
     matplotlib.use("Agg")  # headless: never try to open a window
@@ -1186,6 +1349,25 @@ def _render_png(doc: Drawing, path: Path, dpi: int = 150) -> None:
     # matplotlib keeps global figure state — one renderer at a time.
     with _render_lock:
         qsave(doc.modelspace(), str(path), dpi=int(dpi), bg="#FFFFFF")
+
+
+def _png_backend_name() -> str:
+    """Which library actually rasterises PNG: "mupdf" or "matplotlib"."""
+    if _PNG_MODE == "matplotlib":
+        return "matplotlib"
+    return "mupdf" if _get_png_backend() is not None else "matplotlib"
+
+
+def _render_png(doc: Drawing, path: Path, dpi: int = 150) -> None:
+    """Render PNG: SVG → MuPDF when available, matplotlib as the fallback."""
+    if _PNG_MODE != "matplotlib":
+        try:
+            if _png_via_mupdf(doc, path, dpi):
+                return
+        except Exception:
+            if _PNG_MODE == "mupdf":
+                raise
+    _png_via_matplotlib(doc, path, dpi)
 
 
 def _write_outputs(
@@ -1257,7 +1439,8 @@ def export_svg(drawing: str, file_path: str = "") -> str:
 
 @tool(readonly=True)
 def export_png(drawing: str, file_path: str = "", dpi: int = 150) -> str:
-    """Export the drawing to PNG image (requires matplotlib).
+    """Export the drawing to PNG (rasterised from SVG by PyMuPDF; falls back to
+    matplotlib when it is not installed).
 
     Args:
         drawing: Drawing label.
@@ -1274,7 +1457,7 @@ def export_png(drawing: str, file_path: str = "", dpi: int = 150) -> str:
     return f"✅ Exported PNG → {path}"
 
 
-@tool(readonly=True)
+@tool(readonly=True, core=True)
 def view_drawing(drawing: str, dpi: int = 110) -> Image:
     """Render the drawing and return it as an inline image, so you can LOOK at
     the result without a separate file-open round trip.
@@ -1507,7 +1690,7 @@ def _apply_one(doc: Drawing, op: dict[str, Any]) -> None:
         raise ValueError(f"unknown op '{kind}'")
 
 
-@tool
+@tool(core=True)
 def apply_ops(
     drawing: str, ops: list[dict] | str, finish: bool = False, create: bool = True
 ) -> str:
@@ -1587,7 +1770,7 @@ def apply_ops(
     return out
 
 
-@tool
+@tool(core=True)
 def finish(
     drawing: str,
     save: bool = True,
@@ -1603,7 +1786,7 @@ def finish(
         drawing: Drawing label.
         save: Write the .dxf file.
         svg: Render a .svg preview (fast, native renderer).
-        png: Render a .png preview (slower, needs matplotlib).
+        png: Render a .png preview (fast — SVG rasterised by PyMuPDF).
         dpi: PNG resolution.
         file_path: Override the DXF output path.
     """
@@ -1611,7 +1794,7 @@ def finish(
     return "\n".join(_write_outputs(doc, drawing, save, svg, png, dpi, file_path))
 
 
-@tool(readonly=True)
+@tool(readonly=True, core=True)
 def inspect_drawing(drawing: str, max_entities: int = 20) -> str:
     """Summarise a drawing in ONE call: units, entity counts by type, layers,
     blocks, extents and the first N entities.
@@ -1702,14 +1885,17 @@ _warm_done = threading.Event()
 
 
 def _warm_renderers() -> None:
-    """Warm both renderers off the critical path so the first export is cheap:
-    matplotlib's font cache (6–7 s cold) and the SVG backend's first-run setup
-    (~120 ms). Runs on a background daemon thread."""
+    """Warm the render paths off the critical path so the first export is cheap:
+    the SVG backend's first-run setup (~120 ms) and, when PNG still falls back
+    to matplotlib, its font cache (6–7 s cold). PyMuPDF needs neither, so with
+    it installed the matplotlib import — and its memory — is skipped entirely.
+    Runs on a background daemon thread."""
     try:
-        import matplotlib
+        if _PNG_MODE == "matplotlib" or _get_png_backend() is None:
+            import matplotlib
 
-        matplotlib.use("Agg")
-        from matplotlib import font_manager  # noqa: F401  (triggers cache build)
+            matplotlib.use("Agg")
+            from matplotlib import font_manager  # noqa: F401  (triggers cache build)
     except Exception:
         pass
     try:
@@ -1722,6 +1908,11 @@ def _warm_renderers() -> None:
         msp.add_text("warm", height=0.2)  # text pulls in the font machinery
         with tempfile.TemporaryDirectory() as tmp:
             _render_svg(doc, _Path(tmp) / "warm.svg")
+            if _PNG_MODE != "matplotlib":
+                try:
+                    _png_via_mupdf(doc, _Path(tmp) / "warm.png", 96)
+                except Exception:
+                    pass
     except Exception:
         pass
     finally:
