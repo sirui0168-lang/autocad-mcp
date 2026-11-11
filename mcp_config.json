@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "autocad-mcp": {
+      "command": "/Users/chuanzhang/.gemini/config/plugins/autocad-mcp/.venv/bin/python3",
+      "args": ["/Users/chuanzhang/.gemini/config/plugins/autocad-mcp/server.py"],
+      "env": {
+        "AUTOCAD_MCP_OUTPUT": "/Users/chuanzhang/Documents/AutoCAD_MCP"
+      }
+    }
+  }
+}

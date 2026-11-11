@@ -1,0 +1,11 @@
+{
+  "name": "autocad-mcp",
+  "description": "AutoCAD DXF drawing MCP server using ezdxf. Create, edit, query, and export AutoCAD-compatible DXF drawings on macOS without AutoCAD installed.",
+  "version": "1.0.0",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "创建一个新的 DXF 图纸，画一个 10x8 米的房间平面图",
+    "在图纸上添加门窗和尺寸标注",
+    "打开 DXF 文件并列出所有图层和图元"
+  ]
+}
