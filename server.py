@@ -1509,7 +1509,7 @@ def _apply_one(doc: Drawing, op: dict[str, Any]) -> None:
 
 @tool
 def apply_ops(
-    drawing: str, ops: list[dict] | str, finish: bool = False
+    drawing: str, ops: list[dict] | str, finish: bool = False, create: bool = True
 ) -> str:
     """Execute MANY drawing operations in ONE call — use this instead of dozens
     of single-entity tools. Each failed op is reported but does not abort the batch.
@@ -1518,6 +1518,8 @@ def apply_ops(
         drawing: Drawing label.
         finish: Also save the .dxf and export the .svg right away — the whole
                 plan in a single round trip (same as calling finish() after).
+        create: Auto-create the drawing if it does not exist yet, so a whole
+                plan needs no separate new_drawing call (default True).
         ops: List of op objects (or a JSON array string). Each op has "op" plus
              its parameters. Supported ops:
                {"op":"layer","name":"Walls","color":1}
@@ -1543,7 +1545,20 @@ def apply_ops(
                {"op":"insert","block_name":"DESK","x":1,"y":1,"rotation":0}
                {"op":"delete","handle":"2F"}
     """
-    doc = _get_drawing(drawing)
+    doc = _drawings.get(drawing)
+    created = False
+    if doc is None:
+        if not create:
+            return (
+                f"❌ No drawing named '{drawing}'. Open drawings: "
+                f"{list(_drawings.keys()) or '(none)'}. Call new_drawing first, "
+                f"or leave create=True to auto-create it."
+            )
+        doc = ezdxf.new("R2018")
+        doc.header["$INSUNITS"] = 6
+        _drawings[drawing] = doc
+        _bbox_caches.pop(drawing, None)
+        created = True
     if isinstance(ops, str):
         try:
             ops = json.loads(ops)
@@ -1563,7 +1578,7 @@ def apply_ops(
     _touch(drawing)
     total = len(doc.modelspace())
     head = f"{'✅' if not failures else '⚠️'} apply_ops: {ok}/{len(ops)} ok"
-    tail = f" (drawing '{drawing}', {total} entities)"
+    tail = f" (drawing '{drawing}', {total} entities{' — created' if created else ''})"
     out = head + tail
     if failures:
         out += "\n" + "\n".join(failures[:10])

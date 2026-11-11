@@ -125,7 +125,7 @@ pip install -r requirements.txt
 
 ```text
 apply_ops(drawing="plan", ops=[ ... 全部图元 ... ], finish=True)
-# 这一次调用就写好了 DXF + SVG，整个平面图只有一次往返
+# 图纸不存在会自动创建；这一次调用就写好了 DXF + SVG，整张图只有一次往返
 ```
 
 需要分阶段（先看实体再出图）时，也可以拆成两步：
@@ -182,7 +182,7 @@ apply_ops(drawing="plan", ops=[ ... 全部图元 ... ], finish=True)
 ### 一、批量与复合（推荐优先使用）
 | 工具名称 | 功能描述 | 核心参数 |
 | :--- | :--- | :--- |
-| `apply_ops` | **一次调用执行多条绘图操作**（`finish=True` 顺带存盘 + 导出 SVG） | `drawing`, `ops`（对象数组或 JSON 字符串）, `finish` |
+| `apply_ops` | **一次调用执行多条绘图操作**（`finish=True` 顺带存盘 + 导出 SVG；图纸不存在自动创建） | `drawing`, `ops`（对象数组或 JSON 字符串）, `finish`, `create` |
 | `finish` | **一次收尾：存 DXF + 导出 SVG/PNG** | `drawing`, `save`, `svg`, `png`, `dpi`, `file_path` |
 | `inspect_drawing` | 一次汇总：单位、各类型图元数量、图层、块、包围盒、前 N 个图元 | `drawing`, `max_entities` |
 | `view_drawing` | 渲染并**内联返回图片**，模型可直接查看 | `drawing`, `dpi` |

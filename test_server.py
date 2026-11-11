@@ -89,6 +89,11 @@ def main() -> int:
     )
     check("apply_ops(finish=True) saves DXF", "DXF →" in onepass, onepass)
     check("apply_ops(finish=True) exports SVG", "SVG →" in onepass, onepass)
+    auto = server.apply_ops("auto_created", [{"op": "line", "x1": 0, "y1": 0, "x2": 1, "y2": 1}])
+    check("apply_ops auto-creates missing drawing", "created" in auto, auto)
+    check("apply_ops create=False refuses", "No drawing named" in server.apply_ops(
+        "ghost", [{"op": "line", "x1": 0, "y1": 0, "x2": 1, "y2": 1}], create=False))
+    server.close_drawing("auto_created")
 
     doc = server._get_drawing("test_run")
     msp = doc.modelspace()

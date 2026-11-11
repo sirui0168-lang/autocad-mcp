@@ -4,11 +4,12 @@ When the user asks to create or edit CAD drawings:
 
 ## Efficiency rules (most important)
 
-- **Draw in batches.** Prefer ONE `apply_ops(drawing, ops=[...], finish=True)` call over many
-  single-entity tools. Each separate tool call is a round trip; a floor plan
-  done call-by-call costs dozens of them and feels slow.
-- **Finish in one call.** Use `finish(drawing)` to save the DXF and export the
-  SVG preview together instead of `save_drawing` + `export_svg` + `export_png`.
+- **The whole drawing is ONE call.** `apply_ops(drawing, ops=[...], finish=True)`
+  creates the drawing if needed, runs every op and writes DXF + SVG. A floor
+  plan done call-by-call costs dozens of round trips and feels slow.
+- **Only split when you must.** Use `finish(drawing)` after a first `apply_ops`
+  when you want to inspect the result before writing files; never use
+  `save_drawing` + `export_svg` + `export_png` for that.
 - **Inspect in one call.** Use `inspect_drawing(drawing)` (units, entity counts,
   layers, blocks, extents) instead of `list_layers` + `list_entities` +
   `get_drawing_extents`.

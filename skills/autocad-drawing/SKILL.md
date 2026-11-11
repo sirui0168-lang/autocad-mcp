@@ -23,7 +23,7 @@ done entity-by-entity costs ~35 tool calls.
 
 ```text
 apply_ops(drawing="plan", ops=[ ...every wall, door, window, dim, text... ],
-          finish=True)                     # saves DXF + exports SVG too
+          finish=True)                     # creates the drawing, saves DXF + SVG
 ```
 
 Split it into `apply_ops(...)` + `finish(drawing="plan")` only when you want to
