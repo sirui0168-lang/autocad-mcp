@@ -149,7 +149,7 @@ pip install -r requirements.txt
 | op | 参数 | op | 参数 |
 | :--- | :--- | :--- | :--- |
 | `line` | `x1,y1,x2,y2` | `mtext` | `text,x,y,width,height` |
-| `circle` | `cx,cy,radius` | `dim` | `x1,y1,x2,y2,distance,angle` |
+| `circle` | `cx,cy,radius` | `dim` | `x1,y1,x2,y2,distance,angle,text_height` |
 | `arc` | `cx,cy,radius,start_angle,end_angle` | `hatch` | `points,pattern,scale` |
 | `rect` | `x,y,width,height` | `wall` | `x1,y1,x2,y2,thickness` |
 | `polygon` | `cx,cy,radius,sides,rotation` | `door` | `x,y,width,direction` |
@@ -161,6 +161,8 @@ pip install -r requirements.txt
 | `units` | `units` | `save` | —（存盘） |
 
 大多数 op 还支持 `layer` 和 `color`（ACI 1–255）。
+
+尺寸标注会自动跟着图纸单位走：`text_height` 留空时按 `$INSUNITS` 推断（毫米→2.5，米→0.25），箭头、延伸线和小数位一起缩放；`distance` 留空时偏移 3.5 倍字高，正数放在标注段的右/上方之外。
 
 ### 看图不用开文件
 
@@ -219,7 +221,7 @@ pip install -r requirements.txt
 | :--- | :--- | :--- |
 | `add_text` | 添加单行文字 (TEXT) | `drawing`, `text, x, y, height, rotation`, `layer` |
 | `add_mtext` | 添加格式化多行文字 (MTEXT) | `drawing`, `text, x, y, height, width`, `layer` |
-| `add_dimension_linear` | 线性尺寸标注（严格落在指定图层） | `drawing`, `x1, y1, x2, y2, distance, angle`, `layer` |
+| `add_dimension_linear` | 线性尺寸标注（严格落在指定图层；`distance`/`text_height` 为 0 时按 $INSUNITS 自动缩放） | `drawing`, `x1, y1, x2, y2, distance, angle`, `layer`, `text_height` |
 | `add_hatch` | 封闭区域图案填充 | `drawing`, `pattern` (如 ANSI31/SOLID), `boundary_points_json` |
 
 ### 七、图块 (Block) 定义与复用

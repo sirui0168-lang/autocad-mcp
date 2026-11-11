@@ -45,7 +45,7 @@ Most ops accept an optional `layer` and `color` (ACI 1–255).
 | op | Parameters | op | Parameters |
 | :--- | :--- | :--- | :--- |
 | `layer` | `name, color, linetype` | `mtext` | `text, x, y, width, height` |
-| `units` | `units` | `dim` | `x1, y1, x2, y2, distance, angle` |
+| `units` | `units` | `dim` | `x1, y1, x2, y2, distance, angle, text_height` |
 | `line` | `x1, y1, x2, y2` | `hatch` | `points, pattern, scale` |
 | `circle` | `cx, cy, radius` | `wall` | `x1, y1, x2, y2, thickness` |
 | `arc` | `cx, cy, radius, start_angle, end_angle` | `door` | `x, y, width, direction` |
