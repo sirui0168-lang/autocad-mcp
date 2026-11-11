@@ -285,19 +285,47 @@ def _add_mtext(doc, text, x, y, width=100, height=2.5, layer="0", color=None):
     doc.modelspace().add_mtext(text, dxfattribs=attribs).set_location((x, y))
 
 
-def _add_dim(doc, x1, y1, x2, y2, distance=5.0, angle=0.0, layer="0", text_height=2.5):
+# Typical annotation text height per $INSUNITS value, in drawing units.
+_UNIT_TEXT_HEIGHT = {1: 0.125, 2: 0.25, 4: 2.5, 5: 2.5, 6: 0.25}
+
+
+def _default_text_height(doc) -> float:
+    """Guess a sane text height from the drawing units (mm → 2.5, m → 0.25)."""
+    try:
+        units = int(doc.header.get("$INSUNITS", 4))
+    except Exception:
+        units = 4
+    return _UNIT_TEXT_HEIGHT.get(units, 2.5)
+
+
+def _add_dim(doc, x1, y1, x2, y2, distance=0.0, angle=0.0, layer="0", text_height=0.0):
+    """Linear dimension, auto-scaled to the drawing units.
+
+    `distance` is the signed offset of the dimension line away from the measured
+    segment: positive places it below (horizontal dims) or to the left (vertical
+    dims), 0 lets it scale with the text height.  `text_height` 0 = derive it
+    from $INSUNITS, so a 10 m plan gets 0.25 m text instead of 2.5 m text.
+    """
     _ensure_layer(doc, layer)
-    msp = doc.modelspace()
-    if angle:
-        base = (max(x1, x2) + distance, 0.0)
+    th = float(text_height) if text_height and float(text_height) > 0 else _default_text_height(doc)
+    offset = abs(float(distance)) if distance else th * 3.5
+    if angle:  # vertical measurement along Y, dimension line offset in -X
+        base = (min(x1, x2) - offset, y1)
         ang = 90
-    else:
-        base = (0.0, max(y1, y2) + distance)
+    else:  # horizontal measurement along X, dimension line offset in -Y
+        base = (x1, min(y1, y2) - offset)
         ang = 0
     # NOTE: `layer` used to be ignored here (dimension landed on layer "0").
-    msp.add_linear_dim(
+    doc.modelspace().add_linear_dim(
         base=base, p1=(x1, y1), p2=(x2, y2), angle=ang,
-        override={"dimtxt": text_height},
+        override={
+            "dimtxt": th,
+            "dimasz": th * 0.7,     # arrow size
+            "dimexo": th * 0.4,     # extension line offset
+            "dimexe": th * 0.6,     # extension line beyond dim line
+            "dimgap": th * 0.3,     # gap between text and line
+            "dimdec": 2 if th <= 1 else 0,
+        },
         dxfattribs={"layer": layer},
     ).render()
 
@@ -845,9 +873,10 @@ def add_dimension_linear(
     drawing: str,
     x1: float, y1: float,
     x2: float, y2: float,
-    distance: float = 5.0,
+    distance: float = 0.0,
     angle: float = 0,
     layer: str = "0",
+    text_height: float = 0.0,
 ) -> str:
     """Add a linear dimension between two points.
 
@@ -855,11 +884,13 @@ def add_dimension_linear(
         drawing: Drawing label.
         x1, y1: First measurement point.
         x2, y2: Second measurement point.
-        distance: Offset of dimension line from measured points.
+        distance: Offset of the dimension line away from the measured segment;
+            positive = below/left, 0 = 3.5× the text height.
         angle: Rotation angle of the dimension (0=horizontal, 90=vertical).
         layer: Target layer (now honoured — it used to always land on '0').
+        text_height: Annotation height in drawing units; 0 = auto from $INSUNITS.
     """
-    _add_dim(_get_drawing(drawing), x1, y1, x2, y2, distance, angle, layer)
+    _add_dim(_get_drawing(drawing), x1, y1, x2, y2, distance, angle, layer, text_height)
     _touch(drawing)
     return f"✅ Dimension ({x1},{y1})→({x2},{y2}) on '{layer}'."
 
@@ -1356,7 +1387,8 @@ def _apply_one(doc: Drawing, op: dict[str, Any]) -> None:
     elif kind == "dim":
         _add_dim(
             doc, op["x1"], op["y1"], op["x2"], op["y2"],
-            float(op.get("distance", 5.0)), float(op.get("angle", 0)), layer,
+            float(op.get("distance", 0.0)), float(op.get("angle", 0)), layer,
+            float(op.get("text_height", 0.0)),
         )
     elif kind == "hatch":
         _add_hatch(
