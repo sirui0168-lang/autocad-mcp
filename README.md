@@ -234,7 +234,7 @@ pip install -r requirements.txt
 | 工具名称 | 功能描述 | 核心参数 |
 | :--- | :--- | :--- |
 | `calculate_area`| 计算任意多边形闭合面积与周长 | `drawing`, `points_json` |
-| `get_drawing_extents` | 获取全图实体包围盒（按图纸复用缓存，改图后自动失效） | `drawing` |
+| `get_drawing_extents` | 获取全图实体包围盒（缓存按图元句柄复用，新增图元自动纳入计算） | `drawing` |
 | `list_entities` | 遍历并查看当前模型空间图元（带 `#handle`） | `drawing`, `layer` |
 | `delete_entity` | 删除图元：优先按 `handle`，也可按 `index` | `drawing`, `handle` / `index` |
 

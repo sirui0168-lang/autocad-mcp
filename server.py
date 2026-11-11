@@ -25,7 +25,6 @@ import logging
 import math
 import os
 import signal
-import sys
 import threading
 from contextlib import contextmanager
 from pathlib import Path
