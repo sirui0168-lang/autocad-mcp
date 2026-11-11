@@ -10,67 +10,110 @@ description: >-
 # AutoCAD Drawing Skill
 
 This skill drives the **autocad-mcp** MCP server to create and manipulate
-DXF drawings.  The server runs entirely on macOS via `ezdxf` — no AutoCAD
+DXF drawings. The server runs entirely on macOS via `ezdxf` — no AutoCAD
 installation is required.
 
-## Available MCP Tools
+## The one rule that matters: draw in batches
 
-| Tool                    | Purpose                                          |
-|:------------------------|:-------------------------------------------------|
-| `new_drawing`           | Create a new empty DXF drawing in memory         |
-| `open_drawing`          | Open an existing DXF file                        |
-| `save_drawing`          | Save to DXF file                                 |
-| `close_drawing`         | Close a drawing from memory                      |
-| `list_drawings`         | List all open drawings                           |
-| `set_units`             | Set drawing units (mm, m, inches…)               |
-| `create_layer`          | Create a layer with color and linetype           |
-| `list_layers`           | List all layers                                  |
-| `delete_layer`          | Delete a layer                                   |
-| `draw_line`             | Draw a line segment                              |
-| `draw_circle`           | Draw a circle                                    |
-| `draw_arc`              | Draw an arc                                      |
-| `draw_rectangle`        | Draw a rectangle                                 |
-| `draw_polygon`          | Draw a regular polygon                           |
-| `draw_polyline`         | Draw a polyline through points                   |
-| `draw_spline`           | Draw a B-spline curve                            |
-| `draw_ellipse`          | Draw an ellipse                                  |
-| `add_text`              | Add single-line text                             |
-| `add_mtext`             | Add multi-line text                              |
-| `add_dimension_linear`  | Add linear dimension                             |
-| `add_hatch`             | Add hatch pattern fill                           |
-| `create_block`          | Create a block definition                        |
-| `add_entity_to_block`   | Add entity to block                              |
-| `insert_block`          | Insert a block reference                         |
-| `list_blocks`           | List block definitions                           |
-| `list_entities`         | List entities in modelspace                      |
-| `delete_entity`         | Delete an entity by index                        |
-| `calculate_area`        | Calculate polygon area                           |
-| `get_drawing_extents`   | Get bounding box                                 |
-| `export_svg`            | Export to SVG                                     |
-| `export_png`            | Export to PNG (requires matplotlib)               |
-| `draw_wall`             | Draw a wall (floor plan helper)                  |
-| `draw_door`             | Draw a door symbol                               |
-| `draw_window`           | Draw a window symbol                             |
+Every single-entity tool call is a full round trip (model → server → model),
+and that round trip is what makes drawing feel slow. A three-room floor plan
+done entity-by-entity costs ~35 tool calls.
 
-## Typical Workflow
+**Do this instead — two calls for a whole drawing:**
 
-1. **Create** a new drawing with `new_drawing` and set units with `set_units`.
-2. **Organize** with layers using `create_layer` — e.g., "Walls", "Doors", "Windows", "Dimensions", "Annotations".
-3. **Draw** geometry using draw_* tools.
-4. **Annotate** with `add_text`, `add_mtext`, `add_dimension_linear`.
-5. **Save** with `save_drawing` (DXF) and optionally export to SVG/PNG for preview.
-6. The saved DXF file can be opened directly in AutoCAD 2025.
+```text
+apply_ops(drawing="plan", ops=[ ...every wall, door, window, dim, text... ])
+finish(drawing="plan")                     # saves DXF + exports SVG
+```
 
-## Floor Plan Conventions
+- `apply_ops` executes the whole list in one round trip. A bad op is reported
+  in the result and the rest still run — you can fix just that op afterwards.
+- `finish(save=True, svg=True)` writes the DXF and the SVG preview at once.
+- `inspect_drawing` gives units, entity counts, layers, blocks, extents and the
+  first entities in one call — use it to check your work instead of
+  `list_entities` + `list_layers` + `get_drawing_extents`.
+- `view_drawing` returns the rendered image inline so you can actually look at
+  the result without opening a file.
+
+Use the single-entity tools only when you need to change one thing in a
+drawing you already have.
+
+## Ops for `apply_ops`
+
+Most ops accept an optional `layer` and `color` (ACI 1–255).
+
+| op | Parameters | op | Parameters |
+| :--- | :--- | :--- | :--- |
+| `layer` | `name, color, linetype` | `mtext` | `text, x, y, width, height` |
+| `units` | `units` | `dim` | `x1, y1, x2, y2, distance, angle` |
+| `line` | `x1, y1, x2, y2` | `hatch` | `points, pattern, scale` |
+| `circle` | `cx, cy, radius` | `wall` | `x1, y1, x2, y2, thickness` |
+| `arc` | `cx, cy, radius, start_angle, end_angle` | `door` | `x, y, width, direction` |
+| `rect` | `x, y, width, height` | `window` | `x1, y1, x2, y2, thickness` |
+| `polygon` | `cx, cy, radius, sides, rotation` | `block` | `name` |
+| `polyline` | `points, closed` | `block_entity` | `block_name, entity_type, params` |
+| `spline` | `points, degree` | `insert` | `block_name, x, y, scale, rotation` |
+| `ellipse` | `cx, cy, major_axis_x, major_axis_y, ratio` | `delete` | `handle` (or `index`) |
+| `text` | `text, x, y, height, rotation` | `save` | — |
+
+`points` is a list of `[x, y]` pairs. `hatch.points` must describe a closed
+boundary. `delete` takes the `#handle` shown by `list_entities` — indices shift
+after every deletion, handles do not.
+
+## Typical workflow
+
+1. `new_drawing(name="plan")` — and put `{"op": "units", "units": "meters"}`
+   as the first op (units of a fresh drawing default to millimetres).
+2. Put every layer you need in the same batch:
+   `{"op": "layer", "name": "Walls", "color": 1}` (walls), `Doors` (3),
+   `Windows` (5), `Dims` (2), `Text` (7).
+3. Put all geometry in one `apply_ops` batch, in construction order:
+   outer walls → interior walls → doors → windows → furniture → dimensions →
+   room labels.
+4. `inspect_drawing(drawing="plan")` to verify counts/extents.
+5. `finish(drawing="plan")` — DXF + SVG, then report the paths.
+6. Only if the user asks for a raster image: `export_png(drawing="plan")`
+   (matplotlib; fine for small drawings, slow on tens of thousands of entities).
+
+## Tool reference
+
+| Tool | Purpose |
+|:---|:---|
+| `apply_ops` | **Batch: run many drawing ops in one call** |
+| `finish` | **Save DXF + export SVG/PNG in one call** |
+| `inspect_drawing` | **Summarise drawing: units, counts, layers, blocks, extents** |
+| `view_drawing` | **Render drawing and return it as an inline image** |
+| `new_drawing` / `open_drawing` / `close_drawing` | Drawing session lifecycle |
+| `save_drawing` | Save to DXF (`drawing=` or legacy `name=`) |
+| `list_drawings` | List open drawings |
+| `set_units` | Drawing units (`mm`, `m`, `inches`…) |
+| `create_layer` / `list_layers` / `delete_layer` | Layer management (`delete_layer` migrates entities to layer `0`) |
+| `draw_line` / `draw_circle` / `draw_arc` / `draw_rectangle` | Single primitives |
+| `draw_polygon` / `draw_polyline` / `draw_spline` / `draw_ellipse` | Curves and polylines (`draw_polyline` accepts `is_closed` as an alias of `closed`) |
+| `draw_wall` / `draw_door` / `draw_window` | Architectural symbols |
+| `add_text` / `add_mtext` | Text |
+| `add_dimension_linear` | Linear dimension (honours `layer`) |
+| `add_hatch` | Hatch (`color=0` means black; omit `color` for BYLAYER) |
+| `create_block` / `add_entity_to_block` / `insert_block` / `list_blocks` | Block definitions and references |
+| `list_entities` / `delete_entity` | Inspect and delete (prefer `handle=`) |
+| `calculate_area` / `get_drawing_extents` | Measurements |
+| `export_svg` | SVG (native renderer, fast, no matplotlib needed) |
+| `export_png` | PNG (matplotlib) |
+
+## Floor plan conventions
 
 - Use **meters** as units and **millimeters** for detail.
-- Wall thickness: typically 0.24 m (exterior) or 0.12 m (interior).
-- Door width: standard 0.9 m.
-- Window height: typically 1.5 m, sill at 0.9 m.
-- Create separate layers for Walls, Doors, Windows, Furniture, Dimensions, Text.
-- Use ACI colors: 1=red (walls), 3=green (doors), 5=blue (windows), 7=white (text).
+- Wall thickness: 0.24 m (exterior) or 0.12 m (interior).
+- Door width: 0.9 m.
+- Window height: 1.5 m, sill at 0.9 m.
+- Separate layers for Walls, Doors, Windows, Furniture, Dimensions, Text.
+- ACI colors: 1=red (walls), 3=green (doors), 5=blue (windows), 7=text.
+- Set text height relative to the drawing scale: 0.28 m reads well on a plan
+  drawn in metres.
 
-## Output Directory
+## Output
 
-Files are saved to `~/Documents/AutoCAD_MCP/` by default. Override with
-the `file_path` parameter on `save_drawing` / `export_svg` / `export_png`.
+Files go to `~/Documents/AutoCAD_MCP/` by default (`AUTOCAD_MCP_OUTPUT`
+overrides it). `save_drawing` / `finish` / `export_*` accept `file_path` for an
+explicit location. Unsaved changes are also auto-saved on shutdown to
+`<output>/.autosave/<name>.dxf`.

@@ -5,30 +5,51 @@ This MCP server lets an AI agent create, edit, query, and export
 AutoCAD-compatible DXF drawings entirely on macOS (no AutoCAD installation
 required).  It uses the `ezdxf` library for all geometry operations.
 
-Typical workflow:
-  1. new_drawing / open_drawing   → load or create a drawing
-  2. draw_*, add_text, …          → add geometry
-  3. save_drawing / export_image  → persist or visualise
+Typical (fast) workflow — 2 round trips instead of 35:
+  1. new_drawing / open_drawing                 → create or load a drawing
+  2. apply_ops(drawing, ops=[...])              → many entities in ONE call
+  3. finish(drawing, save=True, svg=True)       → save DXF + preview in ONE call
+  4. inspect_drawing / view_drawing             → verify in ONE call
+
+Every tool runs in a worker thread, so a 0.8 s save or a 1 s export never
+blocks the server: other calls (and heartbeats) stay responsive.
 """
 
 from __future__ import annotations
 
+import atexit
+import functools
+import inspect
 import json
+import logging
 import math
 import os
-import tempfile
+import signal
+import sys
+import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+import anyio
 import ezdxf
 from ezdxf import bbox as ezdxf_bbox
-from ezdxf.addons.drawing import Frontend, RenderContext
+from ezdxf.addons.drawing import Frontend, RenderContext, svg
+from ezdxf.addons.drawing.config import BackgroundPolicy, Configuration
+from ezdxf.addons.drawing.layout import Page
 from ezdxf.document import Drawing
-from ezdxf.math import Vec2
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 
 # ---------------------------------------------------------------------------
-# Server
+# Logging — keep stderr quiet (mcp logs every request at INFO, 60+ lines/run)
+# ---------------------------------------------------------------------------
+
+_LOG_LEVEL = os.environ.get("AUTOCAD_MCP_LOG", "WARNING").upper()
+for _logger_name in ("mcp", "ezdxf", "matplotlib", "httpx"):
+    logging.getLogger(_logger_name).setLevel(_LOG_LEVEL)
+
+# ---------------------------------------------------------------------------
+# Server state
 # ---------------------------------------------------------------------------
 
 mcp = FastMCP("autocad-mcp")
@@ -36,13 +57,83 @@ mcp = FastMCP("autocad-mcp")
 # In-memory store of open drawings keyed by a user-chosen name.
 _drawings: dict[str, Drawing] = {}
 
-# Default output directory
-_output_dir = Path(os.environ.get("AUTOCAD_MCP_OUTPUT", Path.home() / "Documents" / "AutoCAD_MCP"))
+# Per-drawing bounding-box caches (keyed by entity handle → reuse is safe for
+# add/delete; we never mutate geometry in place).
+_bbox_caches: dict[str, ezdxf_bbox.Cache] = {}
+
+# Drawings modified since the last save; flushed to disk on exit.
+_dirty: set[str] = set()
+
+class _RWLock:
+    """Shared/exclusive lock: read-only tools run concurrently, writes exclusive.
+
+    A plain RLock serialised everything, so a 0.8 s export blocked even a
+    1 ms `list_drawings`.  ezdxf Drawing objects are not thread-safe, but
+    readers never mutate, so they can share.
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition(threading.Lock())
+        self._readers = 0
+        self._writer = False
+        self._waiting_writers = 0
+
+    @contextmanager
+    def read(self):
+        with self._cond:
+            while self._writer or self._waiting_writers:
+                self._cond.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._cond.notify_all()
+
+    @contextmanager
+    def write(self):
+        with self._cond:
+            self._waiting_writers += 1
+            try:
+                while self._writer or self._readers:
+                    self._cond.wait()
+            finally:
+                self._waiting_writers -= 1
+            self._writer = True
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._writer = False
+                self._cond.notify_all()
+
+
+_lock = _RWLock()
+
+# Rendering backends keep global state: matplotlib is not thread-safe.
+_render_lock = threading.Lock()
+_bbox_lock = threading.Lock()
+
+# Default output directory (~ and $VARS are expanded).
+_output_dir = Path(os.environ.get("AUTOCAD_MCP_OUTPUT", "~/Documents/AutoCAD_MCP")).expanduser()
 
 
 def _ensure_output_dir() -> Path:
     _output_dir.mkdir(parents=True, exist_ok=True)
     return _output_dir
+
+
+def _resolve_out(file_path: str, drawing: str, ext: str) -> Path:
+    """Return the absolute output path, defaulting to <output_dir>/<drawing>.<ext>."""
+    if file_path:
+        path = Path(file_path).expanduser()
+    else:
+        _ensure_output_dir()
+        path = _output_dir / f"{drawing}.{ext}"
+        return path.resolve()
+    return path.resolve()
 
 
 def _get_drawing(name: str) -> Drawing:
@@ -55,9 +146,279 @@ def _get_drawing(name: str) -> Drawing:
     return _drawings[name]
 
 
+def _touch(name: str) -> None:
+    _dirty.add(name)
+
+
+# ---------------------------------------------------------------------------
+# Tool registration: sync implementation + async (threaded, locked) wrapper
+# ---------------------------------------------------------------------------
+
+
+def tool(fn: Callable[..., Any] | None = None, *, readonly: bool = False):
+    """Register a function as an MCP tool.
+
+    The call runs in a worker thread so it never blocks the event loop, under
+    a shared lock (readonly=True) or an exclusive lock (mutating tools).
+
+    The decorated module-level name still resolves to the original *sync*
+    function, so `server.draw_line(...)` keeps working from scripts and tests.
+    """
+
+    def register(func: Callable[..., Any]) -> Callable[..., Any]:
+        # eval_str turns "Image" (from __future__ annotations) into the real
+        # type — FastMCP needs the class, not the string, to detect `Image`.
+        sig = inspect.signature(func, eval_str=True)
+        guard = _lock.read if readonly else _lock.write
+
+        @functools.wraps(func)
+        async def _call(**kwargs: Any) -> Any:
+            bound = sig.bind(**kwargs)
+            bound.apply_defaults()
+            args, kw = bound.args, bound.kwargs
+
+            def _run() -> Any:
+                with guard():
+                    return func(*args, **kw)
+
+            return await anyio.to_thread.run_sync(_run)
+
+        _call.__signature__ = sig  # type: ignore[attr-defined]
+        mcp.tool()(_call)
+        return func
+
+    return register(fn) if fn is not None else register
+
+
+# ---------------------------------------------------------------------------
+# Geometry helpers — shared by the single-entity tools and by apply_ops
+# ---------------------------------------------------------------------------
+
+
+def _attr(layer: str = "0", color: int | None = None) -> dict[str, Any]:
+    attribs: dict[str, Any] = {"layer": layer or "0"}
+    if color is not None:
+        attribs["color"] = int(color)
+    return attribs
+
+
+def _ensure_layer(doc: Drawing, layer: str, color: int = 7) -> None:
+    if layer and layer not in doc.layers:
+        doc.layers.add(layer, color=int(color))
+
+
+def _points(raw: Any) -> list[tuple[float, float]]:
+    """Accept a JSON string or a list of [x, y] pairs → list of float tuples."""
+    if isinstance(raw, str):
+        raw = json.loads(raw)
+    if not raw or not all(isinstance(p, (list, tuple)) and len(p) >= 2 for p in raw):
+        raise ValueError("points must be an array of [x, y] pairs")
+    return [(float(p[0]), float(p[1])) for p in raw]
+
+
+def _add_line(doc, x1, y1, x2, y2, layer="0", color=None):
+    _ensure_layer(doc, layer)
+    doc.modelspace().add_line((x1, y1), (x2, y2), dxfattribs=_attr(layer, color))
+
+
+def _add_circle(doc, cx, cy, radius, layer="0", color=None):
+    _ensure_layer(doc, layer)
+    doc.modelspace().add_circle((cx, cy), radius, dxfattribs=_attr(layer, color))
+
+
+def _add_arc(doc, cx, cy, radius, start_angle, end_angle, layer="0", color=None):
+    _ensure_layer(doc, layer)
+    doc.modelspace().add_arc(
+        (cx, cy), radius, start_angle, end_angle, dxfattribs=_attr(layer, color)
+    )
+
+
+def _add_rect(doc, x, y, width, height, layer="0", color=None):
+    _ensure_layer(doc, layer)
+    points = [(x, y), (x + width, y), (x + width, y + height), (x, y + height)]
+    doc.modelspace().add_lwpolyline(points, close=True, dxfattribs=_attr(layer, color))
+
+
+def _add_polygon(doc, cx, cy, radius, sides=6, rotation=0.0, layer="0", color=None):
+    _ensure_layer(doc, layer)
+    rot_rad = math.radians(rotation)
+    points = [
+        (
+            cx + radius * math.cos(rot_rad + 2 * math.pi * i / sides),
+            cy + radius * math.sin(rot_rad + 2 * math.pi * i / sides),
+        )
+        for i in range(sides)
+    ]
+    doc.modelspace().add_lwpolyline(points, close=True, dxfattribs=_attr(layer, color))
+
+
+def _add_polyline(doc, points, closed=False, layer="0", color=None):
+    _ensure_layer(doc, layer)
+    doc.modelspace().add_lwpolyline(
+        _points(points), close=bool(closed), dxfattribs=_attr(layer, color)
+    )
+
+
+def _add_spline(doc, points, degree=3, layer="0", color=None):
+    _ensure_layer(doc, layer)
+    doc.modelspace().add_spline(_points(points), degree=degree, dxfattribs=_attr(layer, color))
+
+
+def _add_ellipse(doc, cx, cy, major_axis_x, major_axis_y, ratio=0.5, layer="0", color=None):
+    _ensure_layer(doc, layer)
+    doc.modelspace().add_ellipse(
+        (cx, cy), major_axis=(major_axis_x, major_axis_y, 0), ratio=ratio,
+        dxfattribs=_attr(layer, color),
+    )
+
+
+def _add_text(doc, text, x, y, height=2.5, rotation=0, layer="0", color=None):
+    _ensure_layer(doc, layer)
+    attribs = _attr(layer, color)
+    attribs["rotation"] = rotation
+    doc.modelspace().add_text(text, height=height, dxfattribs=attribs).set_placement((x, y))
+
+
+def _add_mtext(doc, text, x, y, width=100, height=2.5, layer="0", color=None):
+    _ensure_layer(doc, layer)
+    attribs = _attr(layer, color)
+    attribs.update({"char_height": height, "width": width})
+    doc.modelspace().add_mtext(text, dxfattribs=attribs).set_location((x, y))
+
+
+def _add_dim(doc, x1, y1, x2, y2, distance=5.0, angle=0.0, layer="0", text_height=2.5):
+    _ensure_layer(doc, layer)
+    msp = doc.modelspace()
+    if angle:
+        base = (max(x1, x2) + distance, 0.0)
+        ang = 90
+    else:
+        base = (0.0, max(y1, y2) + distance)
+        ang = 0
+    # NOTE: `layer` used to be ignored here (dimension landed on layer "0").
+    msp.add_linear_dim(
+        base=base, p1=(x1, y1), p2=(x2, y2), angle=ang,
+        override={"dimtxt": text_height},
+        dxfattribs={"layer": layer},
+    ).render()
+
+
+def _add_hatch(doc, points, pattern="ANSI31", scale=1.0, layer="0", color=None):
+    _ensure_layer(doc, layer)
+    hatch = doc.modelspace().add_hatch(dxfattribs=_attr(layer))
+    hatch.set_pattern_fill(pattern, scale=scale)
+    # set_pattern_fill() resets dxf.color to 7 — set it afterwards.
+    # `color if color else 7` used to turn color=0 into 7; now None → BYLAYER.
+    hatch.dxf.color = int(color) if color is not None else 256  # 256 = BYLAYER
+    hatch.paths.add_polyline_path(_points(points), is_closed=True)
+
+
+def _add_wall(doc, x1, y1, x2, y2, thickness=0.24, layer="Walls", color=1):
+    _ensure_layer(doc, layer, color)
+    dx, dy = x2 - x1, y2 - y1
+    length = math.hypot(dx, dy)
+    if length == 0:
+        raise ValueError("start and end points are the same")
+    nx, ny = -dy / length * thickness / 2, dx / length * thickness / 2
+    points = [
+        (x1 + nx, y1 + ny),
+        (x2 + nx, y2 + ny),
+        (x2 - nx, y2 - ny),
+        (x1 - nx, y1 - ny),
+    ]
+    doc.modelspace().add_lwpolyline(points, close=True, dxfattribs=_attr(layer))
+
+
+def _add_door(doc, x, y, width=0.9, direction="right", layer="Doors", color=3):
+    _ensure_layer(doc, layer, color)
+    msp = doc.modelspace()
+    attribs = _attr(layer)
+    if str(direction).lower() == "right":
+        msp.add_line((x, y), (x + width, y), dxfattribs=attribs)
+        msp.add_arc((x, y), width, 0, 90, dxfattribs=attribs)
+    else:
+        msp.add_line((x, y), (x - width, y), dxfattribs=attribs)
+        msp.add_arc((x, y), width, 90, 180, dxfattribs=attribs)
+
+
+def _add_window(doc, x1, y1, x2, y2, thickness=0.24, layer="Windows", color=5):
+    """Three parallel lines inside a wall opening (`thickness` was hard-coded)."""
+    _ensure_layer(doc, layer, color)
+    dx, dy = x2 - x1, y2 - y1
+    length = math.hypot(dx, dy)
+    if length == 0:
+        raise ValueError("start and end points are the same")
+    nx, ny = -dy / length * (thickness / 2), dx / length * (thickness / 2)
+    msp = doc.modelspace()
+    for offset in (-1.0, 0.0, 1.0):
+        msp.add_line(
+            (x1 + nx * offset, y1 + ny * offset),
+            (x2 + nx * offset, y2 + ny * offset),
+            dxfattribs=_attr(layer),
+        )
+
+
+def _add_block_entity(doc, block_name, entity_type, params):
+    if block_name not in doc.blocks:
+        raise ValueError(f"block '{block_name}' not found")
+    blk = doc.blocks[block_name]
+    et = str(entity_type).lower()
+    if et == "line":
+        blk.add_line(tuple(params["start"]), tuple(params["end"]))
+    elif et == "circle":
+        blk.add_circle(tuple(params["center"]), params["radius"])
+    elif et == "arc":
+        blk.add_arc(
+            tuple(params["center"]), params["radius"],
+            params["start_angle"], params["end_angle"],
+        )
+    elif et == "lwpolyline":
+        blk.add_lwpolyline(params["points"], close=params.get("closed", False))
+    elif et == "text":
+        blk.add_text(params["text"], height=params.get("height", 2.5)).set_placement(
+            tuple(params["insert"])
+        )
+    else:
+        raise ValueError(
+            f"unknown entity_type '{entity_type}'. Use: line, circle, arc, lwpolyline, text."
+        )
+
+
+def _extents(doc: Drawing, name: str):
+    cache = _bbox_caches.get(name)
+    if cache is None:
+        cache = _bbox_caches[name] = ezdxf_bbox.Cache()
+    return ezdxf_bbox.extents(doc.modelspace(), cache=cache)
+
+
+def _describe_entity(index: int, entity) -> str:
+    etype = entity.dxftype()
+    handle = entity.dxf.handle
+    info = f"  [{index}] #{handle} {etype} layer='{entity.dxf.layer}'"
+    try:
+        if etype == "LINE":
+            info += (
+                f" ({entity.dxf.start.x:.2f},{entity.dxf.start.y:.2f})"
+                f"→({entity.dxf.end.x:.2f},{entity.dxf.end.y:.2f})"
+            )
+        elif etype == "CIRCLE":
+            c = entity.dxf.center
+            info += f" center=({c.x:.2f},{c.y:.2f}) r={entity.dxf.radius:.2f}"
+        elif etype in ("TEXT", "MTEXT"):
+            info += f" '{entity.dxf.text}'"
+        elif etype == "LWPOLYLINE":
+            info += f" {len(entity)} vertices{' closed' if entity.closed else ''}"
+        elif etype == "INSERT":
+            info += f" block='{entity.dxf.name}'"
+    except Exception:  # pragma: no cover - defensive
+        pass
+    return info
+
+
 # ── Drawing lifecycle ──────────────────────────────────────────────────────
 
-@mcp.tool()
+
+@tool
 def new_drawing(name: str, dxf_version: str = "R2018") -> str:
     """Create a new empty DXF drawing in memory.
 
@@ -70,10 +431,11 @@ def new_drawing(name: str, dxf_version: str = "R2018") -> str:
     doc = ezdxf.new(dxf_version)
     doc.header["$INSUNITS"] = 6  # meters; change via set_units if needed
     _drawings[name] = doc
+    _bbox_caches.pop(name, None)
     return f"✅ Created new drawing '{name}' (DXF {dxf_version})."
 
 
-@mcp.tool()
+@tool
 def open_drawing(name: str, file_path: str) -> str:
     """Open an existing DXF file from disk.
 
@@ -91,31 +453,32 @@ def open_drawing(name: str, file_path: str) -> str:
     except Exception as e:
         return f"❌ Failed to open: {e}"
     _drawings[name] = doc
+    _bbox_caches.pop(name, None)
     return f"✅ Opened '{path.name}' as '{name}'."
 
 
-@mcp.tool()
-def save_drawing(name: str, file_path: str = "") -> str:
+@tool(readonly=True)
+def save_drawing(drawing: str = "", file_path: str = "", name: str = "") -> str:
     """Save the drawing to a DXF file.
 
     Args:
-        name: Drawing label.
-        file_path: Where to save. Defaults to <output_dir>/<name>.dxf.
+        drawing: Drawing label.
+        file_path: Where to save. Defaults to <output_dir>/<drawing>.dxf.
+        name: Deprecated alias for `drawing` (kept for backward compatibility).
     """
-    doc = _get_drawing(name)
-    if not file_path:
-        _ensure_output_dir()
-        file_path = str(_output_dir / f"{name}.dxf")
-    path = Path(file_path).expanduser().resolve()
+    target = drawing or name
+    doc = _get_drawing(target)
+    path = _resolve_out(file_path, target, "dxf")
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         doc.saveas(str(path))
     except Exception as e:
         return f"❌ Save failed: {e}"
-    return f"✅ Saved '{name}' → {path}"
+    _dirty.discard(target)
+    return f"✅ Saved '{target}' → {path}"
 
 
-@mcp.tool()
+@tool
 def close_drawing(name: str) -> str:
     """Close a drawing and remove it from memory (does NOT auto-save).
 
@@ -125,26 +488,27 @@ def close_drawing(name: str) -> str:
     if name not in _drawings:
         return f"⚠️ No drawing named '{name}' is open."
     del _drawings[name]
+    _bbox_caches.pop(name, None)
+    _dirty.discard(name)
     return f"✅ Closed drawing '{name}'."
 
 
-@mcp.tool()
+@tool(readonly=True)
 def list_drawings() -> str:
     """List all currently open drawings."""
     if not _drawings:
         return "No drawings are currently open."
     lines = []
     for n, doc in _drawings.items():
-        ver = doc.dxfversion
         msp = doc.modelspace()
-        count = len(list(msp))
-        lines.append(f"  • {n}  (DXF {ver}, {count} entities in modelspace)")
+        lines.append(f"  • {n}  (DXF {doc.dxfversion}, {len(msp)} entities in modelspace)")
     return "Open drawings:\n" + "\n".join(lines)
 
 
 # ── Layer management ───────────────────────────────────────────────────────
 
-@mcp.tool()
+
+@tool
 def create_layer(
     drawing: str,
     layer_name: str,
@@ -162,11 +526,17 @@ def create_layer(
     doc = _get_drawing(drawing)
     if layer_name in doc.layers:
         return f"⚠️ Layer '{layer_name}' already exists."
+    if linetype not in doc.linetypes:
+        doc.layers.add(layer_name, color=color)
+        return (
+            f"⚠️ Layer '{layer_name}' created with linetype 'Continuous' "
+            f"(linetype '{linetype}' is not loaded in this drawing)."
+        )
     doc.layers.add(layer_name, color=color, linetype=linetype)
     return f"✅ Layer '{layer_name}' created (color={color}, linetype={linetype})."
 
 
-@mcp.tool()
+@tool(readonly=True)
 def list_layers(drawing: str) -> str:
     """List all layers in a drawing.
 
@@ -184,9 +554,9 @@ def list_layers(drawing: str) -> str:
     return "Layers:\n" + "\n".join(lines) if lines else "No layers defined."
 
 
-@mcp.tool()
+@tool
 def delete_layer(drawing: str, layer_name: str) -> str:
-    """Delete a layer (entities on it are moved to layer '0').
+    """Delete a layer (ALL entities on it, including block entities, move to '0').
 
     Args:
         drawing: Drawing label.
@@ -197,18 +567,25 @@ def delete_layer(drawing: str, layer_name: str) -> str:
         return "❌ Cannot delete the default layer '0'."
     if layer_name not in doc.layers:
         return f"⚠️ Layer '{layer_name}' does not exist."
-    # Move entities off the layer first
-    msp = doc.modelspace()
-    for entity in msp:
-        if entity.dxf.layer == layer_name:
-            entity.dxf.layer = "0"
+    # Move entities off the layer first — modelspace AND block definitions,
+    # otherwise blocks keep dangling references to a deleted layer.
+    moved = 0
+    for entity in doc.entitydb.values():
+        try:
+            if entity.dxf.layer == layer_name:
+                entity.dxf.layer = "0"
+                moved += 1
+        except Exception:
+            pass
     doc.layers.remove(layer_name)
-    return f"✅ Layer '{layer_name}' deleted; entities moved to '0'."
+    _touch(drawing)
+    return f"✅ Layer '{layer_name}' deleted; {moved} entities moved to '0'."
 
 
 # ── Drawing primitives ─────────────────────────────────────────────────────
 
-@mcp.tool()
+
+@tool
 def draw_line(
     drawing: str,
     x1: float, y1: float,
@@ -225,16 +602,12 @@ def draw_line(
         layer: Target layer name.
         color: Optional ACI color override.
     """
-    doc = _get_drawing(drawing)
-    msp = doc.modelspace()
-    attribs: dict[str, Any] = {"layer": layer}
-    if color is not None:
-        attribs["color"] = color
-    msp.add_line((x1, y1), (x2, y2), dxfattribs=attribs)
+    _add_line(_get_drawing(drawing), x1, y1, x2, y2, layer, color)
+    _touch(drawing)
     return f"✅ Line ({x1},{y1}) → ({x2},{y2}) on layer '{layer}'."
 
 
-@mcp.tool()
+@tool
 def draw_circle(
     drawing: str,
     cx: float, cy: float,
@@ -251,16 +624,12 @@ def draw_circle(
         layer: Target layer name.
         color: Optional ACI color.
     """
-    doc = _get_drawing(drawing)
-    msp = doc.modelspace()
-    attribs: dict[str, Any] = {"layer": layer}
-    if color is not None:
-        attribs["color"] = color
-    msp.add_circle((cx, cy), radius, dxfattribs=attribs)
+    _add_circle(_get_drawing(drawing), cx, cy, radius, layer, color)
+    _touch(drawing)
     return f"✅ Circle center=({cx},{cy}) r={radius} on '{layer}'."
 
 
-@mcp.tool()
+@tool
 def draw_arc(
     drawing: str,
     cx: float, cy: float,
@@ -281,16 +650,12 @@ def draw_arc(
         layer: Target layer.
         color: Optional ACI color.
     """
-    doc = _get_drawing(drawing)
-    msp = doc.modelspace()
-    attribs: dict[str, Any] = {"layer": layer}
-    if color is not None:
-        attribs["color"] = color
-    msp.add_arc((cx, cy), radius, start_angle, end_angle, dxfattribs=attribs)
+    _add_arc(_get_drawing(drawing), cx, cy, radius, start_angle, end_angle, layer, color)
+    _touch(drawing)
     return f"✅ Arc center=({cx},{cy}) r={radius} {start_angle}°→{end_angle}° on '{layer}'."
 
 
-@mcp.tool()
+@tool
 def draw_rectangle(
     drawing: str,
     x: float, y: float,
@@ -308,22 +673,12 @@ def draw_rectangle(
         layer: Target layer.
         color: Optional ACI color.
     """
-    doc = _get_drawing(drawing)
-    msp = doc.modelspace()
-    attribs: dict[str, Any] = {"layer": layer}
-    if color is not None:
-        attribs["color"] = color
-    points = [
-        (x, y),
-        (x + width, y),
-        (x + width, y + height),
-        (x, y + height),
-    ]
-    msp.add_lwpolyline(points, close=True, dxfattribs=attribs)
+    _add_rect(_get_drawing(drawing), x, y, width, height, layer, color)
+    _touch(drawing)
     return f"✅ Rectangle ({x},{y}) {width}×{height} on '{layer}'."
 
 
-@mcp.tool()
+@tool
 def draw_polygon(
     drawing: str,
     cx: float, cy: float,
@@ -344,29 +699,19 @@ def draw_polygon(
         layer: Target layer.
         color: Optional ACI color.
     """
-    doc = _get_drawing(drawing)
-    msp = doc.modelspace()
-    attribs: dict[str, Any] = {"layer": layer}
-    if color is not None:
-        attribs["color"] = color
-    rot_rad = math.radians(rotation)
-    points = []
-    for i in range(sides):
-        angle = rot_rad + 2 * math.pi * i / sides
-        px = cx + radius * math.cos(angle)
-        py = cy + radius * math.sin(angle)
-        points.append((px, py))
-    msp.add_lwpolyline(points, close=True, dxfattribs=attribs)
+    _add_polygon(_get_drawing(drawing), cx, cy, radius, sides, rotation, layer, color)
+    _touch(drawing)
     return f"✅ {sides}-sided polygon center=({cx},{cy}) r={radius} on '{layer}'."
 
 
-@mcp.tool()
+@tool
 def draw_polyline(
     drawing: str,
     points_json: str,
     closed: bool = False,
     layer: str = "0",
     color: int | None = None,
+    is_closed: bool | None = None,
 ) -> str:
     """Draw a lightweight polyline through a list of points.
 
@@ -376,23 +721,20 @@ def draw_polyline(
         closed: Whether to close the polyline.
         layer: Target layer.
         color: Optional ACI color.
+        is_closed: Deprecated alias for `closed` (README/SKILL used this name —
+            it used to be silently dropped, producing an open polyline).
     """
-    doc = _get_drawing(drawing)
-    msp = doc.modelspace()
-    attribs: dict[str, Any] = {"layer": layer}
-    if color is not None:
-        attribs["color"] = color
+    closed = bool(closed) or bool(is_closed)
     try:
-        pts = json.loads(points_json)
-    except json.JSONDecodeError as e:
-        return f"❌ Invalid JSON: {e}"
-    if not pts or not all(isinstance(p, (list, tuple)) and len(p) >= 2 for p in pts):
-        return "❌ points_json must be an array of [x, y] pairs."
-    msp.add_lwpolyline(pts, close=closed, dxfattribs=attribs)
+        pts = _points(points_json)
+    except (ValueError, json.JSONDecodeError) as e:
+        return f"❌ points_json must be a JSON array of [x, y] pairs ({e})."
+    _add_polyline(_get_drawing(drawing), pts, closed, layer, color)
+    _touch(drawing)
     return f"✅ Polyline with {len(pts)} vertices ({'closed' if closed else 'open'}) on '{layer}'."
 
 
-@mcp.tool()
+@tool
 def draw_spline(
     drawing: str,
     points_json: str,
@@ -409,21 +751,16 @@ def draw_spline(
         layer: Target layer.
         color: Optional ACI color.
     """
-    doc = _get_drawing(drawing)
-    msp = doc.modelspace()
-    attribs: dict[str, Any] = {"layer": layer}
-    if color is not None:
-        attribs["color"] = color
     try:
-        pts = json.loads(points_json)
-    except json.JSONDecodeError as e:
-        return f"❌ Invalid JSON: {e}"
-    fit_points = [(p[0], p[1]) for p in pts]
-    msp.add_spline(fit_points, degree=degree, dxfattribs=attribs)
+        fit_points = _points(points_json)
+    except (ValueError, json.JSONDecodeError) as e:
+        return f"❌ points_json must be a JSON array of [x, y] pairs ({e})."
+    _add_spline(_get_drawing(drawing), fit_points, degree, layer, color)
+    _touch(drawing)
     return f"✅ Spline (degree={degree}) with {len(fit_points)} points on '{layer}'."
 
 
-@mcp.tool()
+@tool
 def draw_ellipse(
     drawing: str,
     cx: float, cy: float,
@@ -442,23 +779,17 @@ def draw_ellipse(
         layer: Target layer.
         color: Optional ACI color.
     """
-    doc = _get_drawing(drawing)
-    msp = doc.modelspace()
-    attribs: dict[str, Any] = {"layer": layer}
-    if color is not None:
-        attribs["color"] = color
-    msp.add_ellipse(
-        (cx, cy),
-        major_axis=(major_axis_x, major_axis_y, 0),
-        ratio=ratio,
-        dxfattribs=attribs,
+    _add_ellipse(
+        _get_drawing(drawing), cx, cy, major_axis_x, major_axis_y, ratio, layer, color
     )
+    _touch(drawing)
     return f"✅ Ellipse center=({cx},{cy}) on '{layer}'."
 
 
-# ── Text & Annotations ────────────────────────────────────────────────────
+# ── Text & Annotations ─────────────────────────────────────────────────────
 
-@mcp.tool()
+
+@tool
 def add_text(
     drawing: str,
     text: str,
@@ -479,16 +810,12 @@ def add_text(
         layer: Target layer.
         color: Optional ACI color.
     """
-    doc = _get_drawing(drawing)
-    msp = doc.modelspace()
-    attribs: dict[str, Any] = {"layer": layer, "rotation": rotation}
-    if color is not None:
-        attribs["color"] = color
-    msp.add_text(text, height=height, dxfattribs=attribs).set_placement((x, y))
+    _add_text(_get_drawing(drawing), text, x, y, height, rotation, layer, color)
+    _touch(drawing)
     return f"✅ Text '{text}' at ({x},{y}) height={height} on '{layer}'."
 
 
-@mcp.tool()
+@tool
 def add_mtext(
     drawing: str,
     text: str,
@@ -509,16 +836,12 @@ def add_mtext(
         layer: Target layer.
         color: Optional ACI color.
     """
-    doc = _get_drawing(drawing)
-    msp = doc.modelspace()
-    attribs: dict[str, Any] = {"layer": layer, "char_height": height, "width": width}
-    if color is not None:
-        attribs["color"] = color
-    msp.add_mtext(text, dxfattribs=attribs).set_location((x, y))
+    _add_mtext(_get_drawing(drawing), text, x, y, width, height, layer, color)
+    _touch(drawing)
     return f"✅ MText at ({x},{y}) width={width} on '{layer}'."
 
 
-@mcp.tool()
+@tool
 def add_dimension_linear(
     drawing: str,
     x1: float, y1: float,
@@ -535,34 +858,17 @@ def add_dimension_linear(
         x2, y2: Second measurement point.
         distance: Offset of dimension line from measured points.
         angle: Rotation angle of the dimension (0=horizontal, 90=vertical).
-        layer: Target layer.
+        layer: Target layer (now honoured — it used to always land on '0').
     """
-    doc = _get_drawing(drawing)
-    msp = doc.modelspace()
-    if angle == 0:
-        dim_y = max(y1, y2) + distance
-        msp.add_linear_dim(
-            base=(0, dim_y),
-            p1=(x1, y1),
-            p2=(x2, y2),
-            angle=0,
-            override={"dimtxt": 2.5},
-        ).render()
-    else:
-        dim_x = max(x1, x2) + distance
-        msp.add_linear_dim(
-            base=(dim_x, 0),
-            p1=(x1, y1),
-            p2=(x2, y2),
-            angle=90,
-            override={"dimtxt": 2.5},
-        ).render()
+    _add_dim(_get_drawing(drawing), x1, y1, x2, y2, distance, angle, layer)
+    _touch(drawing)
     return f"✅ Dimension ({x1},{y1})→({x2},{y2}) on '{layer}'."
 
 
 # ── Hatch / Fill ───────────────────────────────────────────────────────────
 
-@mcp.tool()
+
+@tool
 def add_hatch(
     drawing: str,
     points_json: str,
@@ -579,26 +885,21 @@ def add_hatch(
         pattern: Hatch pattern name (e.g. "ANSI31", "SOLID", "BRICK", "GRAVEL").
         scale: Pattern scale factor.
         layer: Target layer.
-        color: Optional ACI color.
+        color: Optional ACI color (None = BYLAYER; color=0 is now preserved).
     """
-    doc = _get_drawing(drawing)
-    msp = doc.modelspace()
-    attribs: dict[str, Any] = {"layer": layer}
-    if color is not None:
-        attribs["color"] = color
     try:
-        pts = json.loads(points_json)
-    except json.JSONDecodeError as e:
-        return f"❌ Invalid JSON: {e}"
-    hatch = msp.add_hatch(color=color if color else 7, dxfattribs=attribs)
-    hatch.set_pattern_fill(pattern, scale=scale)
-    hatch.paths.add_polyline_path([(p[0], p[1]) for p in pts], is_closed=True)
+        pts = _points(points_json)
+    except (ValueError, json.JSONDecodeError) as e:
+        return f"❌ points_json must be a JSON array of [x, y] pairs ({e})."
+    _add_hatch(_get_drawing(drawing), pts, pattern, scale, layer, color)
+    _touch(drawing)
     return f"✅ Hatch '{pattern}' with {len(pts)} boundary points on '{layer}'."
 
 
 # ── Blocks ─────────────────────────────────────────────────────────────────
 
-@mcp.tool()
+
+@tool
 def create_block(drawing: str, block_name: str) -> str:
     """Create a new empty block definition (add entities separately).
 
@@ -610,10 +911,11 @@ def create_block(drawing: str, block_name: str) -> str:
     if block_name in doc.blocks:
         return f"⚠️ Block '{block_name}' already exists."
     doc.blocks.new(name=block_name)
+    _touch(drawing)
     return f"✅ Block '{block_name}' created (empty). Add entities with add_entity_to_block."
 
 
-@mcp.tool()
+@tool
 def add_entity_to_block(
     drawing: str,
     block_name: str,
@@ -631,31 +933,21 @@ def add_entity_to_block(
                      text: {"text":"Hello","insert":[0,0],"height":2.5}.
     """
     doc = _get_drawing(drawing)
-    if block_name not in doc.blocks:
-        return f"❌ Block '{block_name}' not found."
-    blk = doc.blocks[block_name]
     try:
-        p = json.loads(params_json)
+        params = json.loads(params_json)
     except json.JSONDecodeError as e:
         return f"❌ Invalid JSON: {e}"
-
-    et = entity_type.lower()
-    if et == "line":
-        blk.add_line(tuple(p["start"]), tuple(p["end"]))
-    elif et == "circle":
-        blk.add_circle(tuple(p["center"]), p["radius"])
-    elif et == "arc":
-        blk.add_arc(tuple(p["center"]), p["radius"], p["start_angle"], p["end_angle"])
-    elif et == "lwpolyline":
-        blk.add_lwpolyline(p["points"], close=p.get("closed", False))
-    elif et == "text":
-        blk.add_text(p["text"], height=p.get("height", 2.5)).set_placement(tuple(p["insert"]))
-    else:
-        return f"❌ Unknown entity_type '{entity_type}'. Use: line, circle, arc, lwpolyline, text."
-    return f"✅ Added {et} to block '{block_name}'."
+    try:
+        _add_block_entity(doc, block_name, entity_type, params)
+    except ValueError as e:
+        return f"❌ {e}"
+    except KeyError as e:
+        return f"❌ Missing parameter {e} for entity_type '{entity_type}'."
+    _touch(drawing)
+    return f"✅ Added {str(entity_type).lower()} to block '{block_name}'."
 
 
-@mcp.tool()
+@tool
 def insert_block(
     drawing: str,
     block_name: str,
@@ -678,8 +970,8 @@ def insert_block(
     doc = _get_drawing(drawing)
     if block_name not in doc.blocks:
         return f"❌ Block '{block_name}' not found."
-    msp = doc.modelspace()
-    msp.add_blockref(
+    _ensure_layer(doc, layer)
+    doc.modelspace().add_blockref(
         block_name,
         insert=(x, y),
         dxfattribs={
@@ -689,10 +981,11 @@ def insert_block(
             "layer": layer,
         },
     )
+    _touch(drawing)
     return f"✅ Inserted block '{block_name}' at ({x},{y}) on '{layer}'."
 
 
-@mcp.tool()
+@tool(readonly=True)
 def list_blocks(drawing: str) -> str:
     """List all block definitions in a drawing.
 
@@ -708,7 +1001,8 @@ def list_blocks(drawing: str) -> str:
 
 # ── Query & Analysis ──────────────────────────────────────────────────────
 
-@mcp.tool()
+
+@tool(readonly=True)
 def list_entities(drawing: str, layer: str = "") -> str:
     """List entities in modelspace, optionally filtered by layer.
 
@@ -722,39 +1016,53 @@ def list_entities(drawing: str, layer: str = "") -> str:
     for i, entity in enumerate(msp):
         if layer and entity.dxf.layer != layer:
             continue
-        etype = entity.dxftype()
-        elayer = entity.dxf.layer
-        info = f"  [{i}] {etype} layer='{elayer}'"
-        if etype == "LINE":
-            info += f" ({entity.dxf.start.x:.1f},{entity.dxf.start.y:.1f})→({entity.dxf.end.x:.1f},{entity.dxf.end.y:.1f})"
-        elif etype == "CIRCLE":
-            info += f" center=({entity.dxf.center.x:.1f},{entity.dxf.center.y:.1f}) r={entity.dxf.radius:.1f}"
-        elif etype == "TEXT":
-            info += f" '{entity.dxf.text}'"
-        lines.append(info)
+        lines.append(_describe_entity(i, entity))
     if not lines:
         return "No entities found" + (f" on layer '{layer}'" if layer else "") + "."
-    return f"Entities ({len(lines)}):\n" + "\n".join(lines[:100])  # cap at 100
+    more = f"\n  … {len(lines) - 200} more (use inspect_drawing for a summary)" if len(lines) > 200 else ""
+    return f"Entities ({len(lines)}):\n" + "\n".join(lines[:200]) + more
 
 
-@mcp.tool()
-def delete_entity(drawing: str, index: int) -> str:
-    """Delete an entity by its index in modelspace (see list_entities).
+@tool
+def delete_entity(drawing: str, index: int = -1, handle: str = "") -> str:
+    """Delete an entity by index in modelspace OR by its DXF handle.
+
+    Prefer `handle`: indexes shift after every deletion, handles are stable.
 
     Args:
         drawing: Drawing label.
-        index: Entity index from list_entities.
+        index: Entity index from list_entities (shifts after each deletion).
+        handle: DXF handle from list_entities, e.g. "2F". Preferred over index.
     """
     doc = _get_drawing(drawing)
     msp = doc.modelspace()
-    entities = list(msp)
-    if index < 0 or index >= len(entities):
-        return f"❌ Index {index} out of range (0–{len(entities)-1})."
-    msp.delete_entity(entities[index])
-    return f"✅ Deleted entity [{index}]."
+    entity = None
+    if handle:
+        entity = doc.entitydb.get(handle)
+        if entity is None:
+            return f"❌ No entity with handle '{handle}'."
+    else:
+        entities = list(msp)
+        if not entities:
+            return "❌ Modelspace is empty — nothing to delete."
+        if index < 0 or index >= len(entities):
+            return f"❌ Index {index} out of range (0–{len(entities)-1})."
+        entity = entities[index]
+    # Find the layout that owns the entity (modelspace, paper space or a block).
+    # Describe it BEFORE deletion: ezdxf may invalidate the entity on delete.
+    desc = f"{entity.dxftype()} #{entity.dxf.handle}"
+    for layout in (msp, *doc.layouts, *doc.blocks):
+        try:
+            if entity in layout:
+                layout.delete_entity(entity)
+                _touch(drawing)
+                return f"✅ Deleted {desc}."
+        except Exception:
+            continue
+    return f"❌ Entity {desc} is not in any layout."
 
 
-@mcp.tool()
+@tool(readonly=True)
 def calculate_area(drawing: str, points_json: str) -> str:
     """Calculate the area of a closed polygon defined by its vertices.
 
@@ -763,23 +1071,21 @@ def calculate_area(drawing: str, points_json: str) -> str:
         points_json: JSON array of [x, y] vertices forming a closed polygon.
     """
     try:
-        pts = json.loads(points_json)
-    except json.JSONDecodeError as e:
-        return f"❌ Invalid JSON: {e}"
+        pts = _points(points_json)
+    except (ValueError, json.JSONDecodeError) as e:
+        return f"❌ points_json must be a JSON array of [x, y] pairs ({e})."
     n = len(pts)
     if n < 3:
         return "❌ Need at least 3 points."
-    # Shoelace formula
     area = 0.0
     for i in range(n):
         j = (i + 1) % n
         area += pts[i][0] * pts[j][1]
         area -= pts[j][0] * pts[i][1]
-    area = abs(area) / 2.0
-    return f"✅ Area = {area:.4f} square units."
+    return f"✅ Area = {abs(area) / 2.0:.4f} square units."
 
 
-@mcp.tool()
+@tool(readonly=True)
 def get_drawing_extents(drawing: str) -> str:
     """Get the bounding box of all entities in the drawing.
 
@@ -787,9 +1093,7 @@ def get_drawing_extents(drawing: str) -> str:
         drawing: Drawing label.
     """
     doc = _get_drawing(drawing)
-    msp = doc.modelspace()
-    cache = ezdxf_bbox.Cache()
-    box = ezdxf_bbox.extents(msp, cache=cache)
+    box = _extents(doc, drawing)
     if not box.has_data:
         return "Drawing is empty — no extents."
     return (
@@ -810,7 +1114,8 @@ _UNITS_MAP = {
     "microns": 13, "decimeters": 14,
 }
 
-@mcp.tool()
+
+@tool
 def set_units(drawing: str, units: str = "millimeters") -> str:
     """Set the drawing units.
 
@@ -829,54 +1134,88 @@ def set_units(drawing: str, units: str = "millimeters") -> str:
 
 # ── Export / Render ────────────────────────────────────────────────────────
 
-@mcp.tool()
+
+def _render_svg(doc: Drawing, path: Path) -> None:
+    """Native ezdxf SVG backend: ~8x faster than matplotlib, no font cache."""
+    if len(doc.modelspace()) == 0:
+        raise ValueError("drawing is empty — nothing to render")
+    backend = svg.SVGBackend()
+    config = Configuration(background_policy=BackgroundPolicy.WHITE)
+    Frontend(RenderContext(doc), backend, config=config).draw_layout(
+        doc.modelspace(), finalize=True
+    )
+    path.write_text(backend.get_string(Page(0, 0)), encoding="utf-8")
+
+
+def _render_png(doc: Drawing, path: Path, dpi: int = 150) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")  # headless: never try to open a window
+    from ezdxf.addons.drawing.matplotlib import qsave
+
+    # matplotlib keeps global figure state — one renderer at a time.
+    with _render_lock:
+        qsave(doc.modelspace(), str(path), dpi=int(dpi), bg="#FFFFFF")
+
+
+@tool(readonly=True)
 def export_svg(drawing: str, file_path: str = "") -> str:
-    """Export the drawing to SVG for quick preview.
+    """Export the drawing to SVG for quick preview (fast native renderer).
 
     Args:
         drawing: Drawing label.
-        file_path: Output path. Defaults to <output_dir>/<name>.svg.
+        file_path: Output path. Defaults to <output_dir>/<drawing>.svg.
     """
     doc = _get_drawing(drawing)
-    if not file_path:
-        _ensure_output_dir()
-        file_path = str(_output_dir / f"{drawing}.svg")
-    path = Path(file_path).expanduser().resolve()
+    path = _resolve_out(file_path, drawing, "svg")
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        from ezdxf.addons.drawing.matplotlib import qsave
-        qsave(doc.modelspace(), str(path), bg="#FFFFFF")
+        _render_svg(doc, path)
     except Exception as e:
         return f"❌ SVG export failed: {e}"
     return f"✅ Exported SVG → {path}"
 
 
-@mcp.tool()
+@tool(readonly=True)
 def export_png(drawing: str, file_path: str = "", dpi: int = 150) -> str:
-    """Export the drawing to PNG image.
+    """Export the drawing to PNG image (requires matplotlib).
 
     Args:
         drawing: Drawing label.
-        file_path: Output path. Defaults to <output_dir>/<name>.png.
+        file_path: Output path. Defaults to <output_dir>/<drawing>.png.
         dpi: Resolution in dots per inch.
     """
     doc = _get_drawing(drawing)
-    if not file_path:
-        _ensure_output_dir()
-        file_path = str(_output_dir / f"{drawing}.png")
-    path = Path(file_path).expanduser().resolve()
+    path = _resolve_out(file_path, drawing, "png")
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        from ezdxf.addons.drawing.matplotlib import qsave
-        qsave(doc.modelspace(), str(path), dpi=dpi, bg="#FFFFFF")
+        _render_png(doc, path, dpi)
     except Exception as e:
         return f"❌ PNG export failed: {e}"
     return f"✅ Exported PNG → {path}"
 
 
+@tool(readonly=True)
+def view_drawing(drawing: str, dpi: int = 110) -> Image:
+    """Render the drawing and return it as an inline image, so you can LOOK at
+    the result without a separate file-open round trip.
+
+    Args:
+        drawing: Drawing label.
+        dpi: Raster resolution (110 is a good preview size).
+    """
+    doc = _get_drawing(drawing)
+    _ensure_output_dir()
+    path = _output_dir / ".preview" / f"{drawing}.png"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _render_png(doc, path, dpi)
+    return Image(path=str(path))
+
+
 # ── Convenience: template shapes ───────────────────────────────────────────
 
-@mcp.tool()
+
+@tool
 def draw_wall(
     drawing: str,
     x1: float, y1: float,
@@ -893,31 +1232,15 @@ def draw_wall(
         thickness: Wall thickness in drawing units.
         layer: Target layer (auto-created if needed).
     """
-    doc = _get_drawing(drawing)
-    msp = doc.modelspace()
-    # Auto-create layer
-    if layer not in doc.layers:
-        doc.layers.add(layer, color=1)
-
-    dx = x2 - x1
-    dy = y2 - y1
-    length = math.sqrt(dx * dx + dy * dy)
-    if length == 0:
-        return "❌ Start and end points are the same."
-    # Normal vector
-    nx = -dy / length * thickness / 2
-    ny = dx / length * thickness / 2
-    pts = [
-        (x1 + nx, y1 + ny),
-        (x2 + nx, y2 + ny),
-        (x2 - nx, y2 - ny),
-        (x1 - nx, y1 - ny),
-    ]
-    msp.add_lwpolyline(pts, close=True, dxfattribs={"layer": layer})
+    try:
+        _add_wall(_get_drawing(drawing), x1, y1, x2, y2, thickness, layer)
+    except ValueError as e:
+        return f"❌ {e}"
+    _touch(drawing)
     return f"✅ Wall ({x1},{y1})→({x2},{y2}) t={thickness} on '{layer}'."
 
 
-@mcp.tool()
+@tool
 def draw_door(
     drawing: str,
     x: float, y: float,
@@ -934,26 +1257,17 @@ def draw_door(
         direction: "left" or "right" swing direction.
         layer: Target layer.
     """
-    doc = _get_drawing(drawing)
-    msp = doc.modelspace()
-    if layer not in doc.layers:
-        doc.layers.add(layer, color=3)
-
-    attribs = {"layer": layer}
-    if direction.lower() == "right":
-        msp.add_line((x, y), (x + width, y), dxfattribs=attribs)
-        msp.add_arc((x, y), width, 0, 90, dxfattribs=attribs)
-    else:
-        msp.add_line((x, y), (x - width, y), dxfattribs=attribs)
-        msp.add_arc((x, y), width, 90, 180, dxfattribs=attribs)
+    _add_door(_get_drawing(drawing), x, y, width, direction, layer)
+    _touch(drawing)
     return f"✅ Door at ({x},{y}) width={width} swing={direction} on '{layer}'."
 
 
-@mcp.tool()
+@tool
 def draw_window(
     drawing: str,
     x1: float, y1: float,
     x2: float, y2: float,
+    thickness: float = 0.24,
     layer: str = "Windows",
 ) -> str:
     """Draw a window symbol (three parallel lines) for floor plans.
@@ -962,31 +1276,368 @@ def draw_window(
         drawing: Drawing label.
         x1, y1: Window start point.
         x2, y2: Window end point.
+        thickness: Window frame width in drawing units (was hard-coded 0.24).
         layer: Target layer.
+    """
+    try:
+        _add_window(_get_drawing(drawing), x1, y1, x2, y2, thickness, layer)
+    except ValueError as e:
+        return f"❌ {e}"
+    _touch(drawing)
+    return f"✅ Window ({x1},{y1})→({x2},{y2}) t={thickness} on '{layer}'."
+
+
+# ── Batch / composite tools (the fast path) ────────────────────────────────
+
+_OP_ALIASES = {
+    "rectangle": "rect",
+    "dimension": "dim",
+    "polygon": "polygon",
+    "layer_create": "layer",
+    "block_entity": "block_entity",
+}
+
+
+def _apply_one(doc: Drawing, op: dict[str, Any]) -> None:
+    """Execute a single op from apply_ops. Raises ValueError on bad input."""
+    if not isinstance(op, dict):
+        raise ValueError(f"op must be an object, got {type(op).__name__}")
+    kind = str(op.get("op") or op.get("type") or "").strip().lower()
+    kind = _OP_ALIASES.get(kind, kind)
+    layer = str(op.get("layer", "0"))
+    color = op.get("color")
+
+    if kind == "layer":
+        name = str(op.get("name") or op.get("layer_name") or "")
+        if not name:
+            raise ValueError("layer op needs 'name'")
+        _ensure_layer(doc, name, int(op.get("color", 7)))
+        return
+    if kind == "units":
+        units = str(op.get("units", "")).lower()
+        if units not in _UNITS_MAP:
+            raise ValueError(f"unknown unit '{units}'")
+        doc.header["$INSUNITS"] = _UNITS_MAP[units]
+        return
+    if kind == "line":
+        _add_line(doc, op["x1"], op["y1"], op["x2"], op["y2"], layer, color)
+    elif kind == "circle":
+        _add_circle(doc, op["cx"], op["cy"], op["radius"], layer, color)
+    elif kind == "arc":
+        _add_arc(
+            doc, op["cx"], op["cy"], op["radius"],
+            op["start_angle"], op["end_angle"], layer, color,
+        )
+    elif kind == "rect":
+        _add_rect(doc, op["x"], op["y"], op["width"], op["height"], layer, color)
+    elif kind == "polygon":
+        _add_polygon(
+            doc, op["cx"], op["cy"], op["radius"], int(op.get("sides", 6)),
+            float(op.get("rotation", 0.0)), layer, color,
+        )
+    elif kind == "polyline":
+        _add_polyline(doc, op["points"], op.get("closed", False), layer, color)
+    elif kind == "spline":
+        _add_spline(doc, op["points"], int(op.get("degree", 3)), layer, color)
+    elif kind == "ellipse":
+        _add_ellipse(
+            doc, op["cx"], op["cy"], op["major_axis_x"], op["major_axis_y"],
+            float(op.get("ratio", 0.5)), layer, color,
+        )
+    elif kind == "text":
+        _add_text(
+            doc, op["text"], op["x"], op["y"], float(op.get("height", 2.5)),
+            float(op.get("rotation", 0)), layer, color,
+        )
+    elif kind == "mtext":
+        _add_mtext(
+            doc, op["text"], op["x"], op["y"], float(op.get("width", 100)),
+            float(op.get("height", 2.5)), layer, color,
+        )
+    elif kind == "dim":
+        _add_dim(
+            doc, op["x1"], op["y1"], op["x2"], op["y2"],
+            float(op.get("distance", 5.0)), float(op.get("angle", 0)), layer,
+        )
+    elif kind == "hatch":
+        _add_hatch(
+            doc, op["points"], str(op.get("pattern", "ANSI31")),
+            float(op.get("scale", 1.0)), layer, color,
+        )
+    elif kind == "wall":
+        # floor-plan helpers have their own layer defaults when none is given
+        _add_wall(
+            doc, op["x1"], op["y1"], op["x2"], op["y2"],
+            float(op.get("thickness", 0.24)),
+            str(op.get("layer") or "Walls"),
+        )
+    elif kind == "door":
+        _add_door(
+            doc, op["x"], op["y"], float(op.get("width", 0.9)),
+            str(op.get("direction", "right")), str(op.get("layer") or "Doors"),
+        )
+    elif kind == "window":
+        _add_window(
+            doc, op["x1"], op["y1"], op["x2"], op["y2"],
+            float(op.get("thickness", 0.24)), str(op.get("layer") or "Windows"),
+        )
+    elif kind == "block":
+        name = str(op.get("name") or op.get("block_name") or "")
+        if not name:
+            raise ValueError("block op needs 'name'")
+        if name not in doc.blocks:
+            doc.blocks.new(name=name)
+    elif kind == "block_entity":
+        _add_block_entity(
+            doc, op["block_name"], op["entity_type"], op.get("params") or {}
+        )
+    elif kind == "insert":
+        block_name = str(op.get("block_name") or op.get("name") or "")
+        if block_name not in doc.blocks:
+            raise ValueError(f"block '{block_name}' not found")
+        _ensure_layer(doc, layer)
+        doc.modelspace().add_blockref(
+            block_name,
+            insert=(op["x"], op["y"]),
+            dxfattribs={
+                "xscale": float(op.get("scale_x", 1.0)),
+                "yscale": float(op.get("scale_y", 1.0)),
+                "rotation": float(op.get("rotation", 0)),
+                "layer": layer,
+            },
+        )
+    elif kind == "delete":
+        handle = str(op.get("handle", ""))
+        if not handle:
+            raise ValueError("delete op needs 'handle'")
+        entity = doc.entitydb.get(handle)
+        if entity is None:
+            raise ValueError(f"no entity with handle '{handle}'")
+        for layout in (doc.modelspace(), *doc.layouts, *doc.blocks):
+            try:
+                if entity in layout:
+                    layout.delete_entity(entity)
+                    return
+            except Exception:
+                continue
+        raise ValueError(f"entity #{handle} is not in any layout")
+    elif kind == "save":
+        doc.saveas(str(_resolve_out(op.get("file_path", ""), "drawing", "dxf")))
+    else:
+        raise ValueError(f"unknown op '{kind}'")
+
+
+@tool
+def apply_ops(drawing: str, ops: list[dict] | str) -> str:
+    """Execute MANY drawing operations in ONE call — use this instead of dozens
+    of single-entity tools. Each failed op is reported but does not abort the batch.
+
+    Args:
+        drawing: Drawing label.
+        ops: List of op objects (or a JSON array string). Each op has "op" plus
+             its parameters. Supported ops:
+               {"op":"layer","name":"Walls","color":1}
+               {"op":"units","units":"meters"}
+               {"op":"line","x1":0,"y1":0,"x2":4,"y2":0,"layer":"Walls","color":1}
+               {"op":"circle","cx":2,"cy":2,"radius":0.5}
+               {"op":"arc","cx":0,"cy":0,"radius":1,"start_angle":0,"end_angle":90}
+               {"op":"rect","x":0,"y":0,"width":4,"height":3}
+               {"op":"polygon","cx":0,"cy":0,"radius":1,"sides":6,"rotation":0}
+               {"op":"polyline","points":[[0,0],[1,1]],"closed":false}
+               {"op":"spline","points":[[0,0],[1,2],[3,1]],"degree":3}
+               {"op":"ellipse","cx":0,"cy":0,"major_axis_x":2,"major_axis_y":0,"ratio":0.5}
+               {"op":"text","text":"Living room","x":1,"y":1,"height":0.3}
+               {"op":"mtext","text":"Line1\\PLine2","x":0,"y":0,"width":5}
+               {"op":"dim","x1":0,"y1":0,"x2":4,"y2":0,"distance":0.5,"angle":0}
+               {"op":"hatch","points":[[0,0],[1,0],[1,1]],"pattern":"ANSI31"}
+               {"op":"wall","x1":0,"y1":0,"x2":4,"y2":0,"thickness":0.24}
+               {"op":"door","x":1,"y":0,"width":0.9,"direction":"right"}
+               {"op":"window","x1":2,"y1":0,"x2":3,"y2":0,"thickness":0.24}
+               {"op":"block","name":"DESK"}
+               {"op":"block_entity","block_name":"DESK","entity_type":"circle",
+                "params":{"center":[0,0],"radius":0.5}}
+               {"op":"insert","block_name":"DESK","x":1,"y":1,"rotation":0}
+               {"op":"delete","handle":"2F"}
+    """
+    doc = _get_drawing(drawing)
+    if isinstance(ops, str):
+        try:
+            ops = json.loads(ops)
+        except json.JSONDecodeError as e:
+            return f"❌ ops JSON parse error: {e}"
+    if not isinstance(ops, list):
+        return "❌ ops must be a list of objects."
+
+    ok, failures = 0, []
+    for i, op in enumerate(ops):
+        try:
+            _apply_one(doc, op)
+            ok += 1
+        except Exception as e:  # one bad op must not kill the batch
+            name = (op.get("op") or op.get("type")) if isinstance(op, dict) else "?"
+            failures.append(f"  ✗ #{i} {name}: {e}")
+    _touch(drawing)
+    total = len(doc.modelspace())
+    head = f"{'✅' if not failures else '⚠️'} apply_ops: {ok}/{len(ops)} ok"
+    tail = f" (drawing '{drawing}', {total} entities)"
+    if failures:
+        return head + tail + "\n" + "\n".join(failures[:10])
+    return head + tail
+
+
+@tool
+def finish(
+    drawing: str,
+    save: bool = True,
+    svg: bool = True,
+    png: bool = False,
+    dpi: int = 150,
+    file_path: str = "",
+) -> str:
+    """Save the DXF and export previews in ONE call (replaces save + export_svg
+    + export_png round trips). Returns every output path.
+
+    Args:
+        drawing: Drawing label.
+        save: Write the .dxf file.
+        svg: Render a .svg preview (fast, native renderer).
+        png: Render a .png preview (slower, needs matplotlib).
+        dpi: PNG resolution.
+        file_path: Override the DXF output path.
+    """
+    doc = _get_drawing(drawing)
+    lines: list[str] = [f"✅ Finished '{drawing}' ({len(doc.modelspace())} entities):"]
+    failures = 0
+    if save:
+        path = _resolve_out(file_path, drawing, "dxf")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            doc.saveas(str(path))
+            _dirty.discard(drawing)
+            lines.append(f"  DXF → {path}")
+        except Exception as e:
+            failures += 1
+            lines.append(f"  ✗ DXF save failed: {e}")
+    if svg:
+        path = _resolve_out("", drawing, "svg")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _render_svg(doc, path)
+            lines.append(f"  SVG → {path}")
+        except Exception as e:
+            failures += 1
+            lines.append(f"  ✗ SVG export failed: {e}")
+    if png:
+        path = _resolve_out("", drawing, "png")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _render_png(doc, path, dpi)
+            lines.append(f"  PNG → {path}")
+        except Exception as e:
+            failures += 1
+            lines.append(f"  ✗ PNG export failed: {e}")
+    if failures:
+        lines.append(f"⚠️ {failures} step(s) failed.")
+    return "\n".join(lines)
+
+
+@tool(readonly=True)
+def inspect_drawing(drawing: str, max_entities: int = 20) -> str:
+    """Summarise a drawing in ONE call: units, entity counts by type, layers,
+    blocks, extents and the first N entities.
+
+    Args:
+        drawing: Drawing label.
+        max_entities: How many entities to list (default 20).
     """
     doc = _get_drawing(drawing)
     msp = doc.modelspace()
-    if layer not in doc.layers:
-        doc.layers.add(layer, color=5)
+    entities = list(msp)
+    counts: dict[str, int] = {}
+    for e in entities:
+        counts[e.dxftype()] = counts.get(e.dxftype(), 0) + 1
+    layers = [layer.dxf.name for layer in doc.layers]
+    blocks = [b.name for b in doc.blocks if not b.name.startswith("*")]
+    units = doc.header.get("$INSUNITS", 0)
 
-    dx = x2 - x1
-    dy = y2 - y1
-    length = math.sqrt(dx * dx + dy * dy)
-    if length == 0:
-        return "❌ Start and end points are the same."
-    nx = -dy / length * 0.06
-    ny = dx / length * 0.06
-    attribs = {"layer": layer}
-    # Three parallel lines
-    for offset in [-1, 0, 1]:
-        ox = nx * offset * 2
-        oy = ny * offset * 2
-        msp.add_line(
-            (x1 + ox, y1 + oy),
-            (x2 + ox, y2 + oy),
-            dxfattribs=attribs,
+    lines = [
+        f"Drawing '{drawing}' — DXF {doc.dxfversion}, $INSUNITS={units}",
+        f"  Entities: {len(entities)}"
+        + ("  (" + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())) + ")" if counts else ""),
+        f"  Layers ({len(layers)}): " + ", ".join(layers),
+        f"  Blocks ({len(blocks)}): " + (", ".join(blocks) if blocks else "—"),
+    ]
+    box = _extents(doc, drawing)
+    if box.has_data:
+        lines.append(
+            f"  Extents: ({box.extmin.x:.3f}, {box.extmin.y:.3f}) → "
+            f"({box.extmax.x:.3f}, {box.extmax.y:.3f}), "
+            f"size {box.size.x:.3f} × {box.size.y:.3f}"
         )
-    return f"✅ Window ({x1},{y1})→({x2},{y2}) on '{layer}'."
+    else:
+        lines.append("  Extents: (empty)")
+    if entities:
+        shown = min(max(int(max_entities), 0), len(entities))
+        lines.append(f"  First {shown} entities:")
+        lines.extend(_describe_entity(i, e) for i, e in enumerate(entities[:shown]))
+        if len(entities) > shown:
+            lines.append(f"  … {len(entities) - shown} more")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Shutdown handling — never lose a drawing because the server was restarted
+# ---------------------------------------------------------------------------
+
+
+def _autosave() -> None:
+    if not _dirty:
+        return
+    saved: set[str] = set()
+    try:
+        root = _output_dir / ".autosave"
+        root.mkdir(parents=True, exist_ok=True)
+        for name in sorted(_dirty):
+            doc = _drawings.get(name)
+            if doc is None:
+                saved.add(name)  # nothing left to persist
+                continue
+            try:
+                with _lock.read():
+                    doc.saveas(str(root / f"{name}.dxf"))
+                saved.add(name)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    finally:
+        _dirty.difference_update(saved)
+
+
+atexit.register(_autosave)
+
+
+def _install_signal_handlers() -> None:
+    def _bail(signum, frame):
+        raise SystemExit(0)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, _bail)
+        except Exception:
+            pass
+
+
+def _warm_matplotlib() -> None:
+    """Build matplotlib's font cache in the background so the first PNG export
+    does not pay the 6–7 s cold-start cost."""
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        from matplotlib import font_manager  # noqa: F401  (triggers cache build)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -994,4 +1645,7 @@ def draw_window(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    _install_signal_handlers()
+    if os.environ.get("AUTOCAD_MCP_WARM", "1") != "0":
+        threading.Thread(target=_warm_matplotlib, daemon=True).start()
     mcp.run()
