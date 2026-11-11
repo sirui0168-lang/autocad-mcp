@@ -50,6 +50,10 @@ async def main() -> None:
     print(f"registered tools                  {len(tools):8d} tools")
     print(f"tools/list schema size            {len(schema):8d} chars (~{len(schema)//4} tokens)")
 
+    # let the background renderer warm-up finish, as it would before a real call
+    if server._warm_done.wait(10):
+        print(f"renderer warm-up                  done")
+
     print("\n" + "=" * 68)
     print("2. floor plan: batch ops + finish (the agent's real workflow)")
     print("=" * 68)
@@ -84,6 +88,15 @@ async def main() -> None:
     res = server.apply_ops("bench", ops)
     apply_ms = ms(t)
     print(f"apply_ops  ({len(ops)} ops, 1 round trip)   {apply_ms:8.1f} ms   {res.splitlines()[0]}")
+
+    # v1.2.0: the same drawing in ONE round trip
+    server.new_drawing("bench1", "R2018")
+    server.set_units("bench1", "meters")
+    t = time.perf_counter()
+    res1 = server.apply_ops("bench1", ops, finish=True)
+    onepass_ms = ms(t)
+    print(f"apply_ops(finish=True) ({len(ops)} ops, 1 round trip) {onepass_ms:8.1f} ms   "
+          f"{'DXF+SVG ok' if 'SVG →' in res1 else 'FAILED'}")
 
     t = time.perf_counter()
     res = server.finish("bench", save=True, svg=True)
@@ -163,7 +176,7 @@ async def main() -> None:
     print("summary")
     print("=" * 68)
     print(f"  start-up                       {IMPORT_MS:8.1f} ms")
-    print(f"  floor plan: 2 tool calls       {apply_ms + finish_ms:8.1f} ms "
+    print(f"  floor plan: 1 tool call        {onepass_ms:8.1f} ms "
           f"(was ~35 round trips)")
     print(f"  50k-entity SVG export          {svg_ms:8.1f} ms (matplotlib was ~7000 ms)")
     print(f"  server blocked during export   {'no' if side < 100 else 'yes'}")

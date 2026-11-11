@@ -1188,6 +1188,55 @@ def _render_png(doc: Drawing, path: Path, dpi: int = 150) -> None:
         qsave(doc.modelspace(), str(path), dpi=int(dpi), bg="#FFFFFF")
 
 
+def _write_outputs(
+    doc: Drawing,
+    drawing: str,
+    save: bool = True,
+    svg: bool = True,
+    png: bool = False,
+    dpi: int = 150,
+    file_path: str = "",
+) -> list[str]:
+    """Save DXF and render previews; return one status line per output.
+
+    Shared by `finish` and by `apply_ops(finish=True)` so a whole drawing fits
+    into a single round trip.
+    """
+    lines: list[str] = [f"✅ Finished '{drawing}' ({len(doc.modelspace())} entities):"]
+    failures = 0
+    if save:
+        path = _resolve_out(file_path, drawing, "dxf")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            doc.saveas(str(path))
+            _dirty.discard(drawing)
+            lines.append(f"  DXF → {path}")
+        except Exception as e:
+            failures += 1
+            lines.append(f"  ✗ DXF save failed: {e}")
+    if svg:
+        path = _resolve_out("", drawing, "svg")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _render_svg(doc, path)
+            lines.append(f"  SVG → {path}")
+        except Exception as e:
+            failures += 1
+            lines.append(f"  ✗ SVG export failed: {e}")
+    if png:
+        path = _resolve_out("", drawing, "png")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _render_png(doc, path, dpi)
+            lines.append(f"  PNG → {path}")
+        except Exception as e:
+            failures += 1
+            lines.append(f"  ✗ PNG export failed: {e}")
+    if failures:
+        lines.append(f"⚠️ {failures} step(s) failed.")
+    return lines
+
+
 @tool(readonly=True)
 def export_svg(drawing: str, file_path: str = "") -> str:
     """Export the drawing to SVG for quick preview (fast native renderer).
@@ -1459,12 +1508,16 @@ def _apply_one(doc: Drawing, op: dict[str, Any]) -> None:
 
 
 @tool
-def apply_ops(drawing: str, ops: list[dict] | str) -> str:
+def apply_ops(
+    drawing: str, ops: list[dict] | str, finish: bool = False
+) -> str:
     """Execute MANY drawing operations in ONE call — use this instead of dozens
     of single-entity tools. Each failed op is reported but does not abort the batch.
 
     Args:
         drawing: Drawing label.
+        finish: Also save the .dxf and export the .svg right away — the whole
+                plan in a single round trip (same as calling finish() after).
         ops: List of op objects (or a JSON array string). Each op has "op" plus
              its parameters. Supported ops:
                {"op":"layer","name":"Walls","color":1}
@@ -1511,9 +1564,12 @@ def apply_ops(drawing: str, ops: list[dict] | str) -> str:
     total = len(doc.modelspace())
     head = f"{'✅' if not failures else '⚠️'} apply_ops: {ok}/{len(ops)} ok"
     tail = f" (drawing '{drawing}', {total} entities)"
+    out = head + tail
     if failures:
-        return head + tail + "\n" + "\n".join(failures[:10])
-    return head + tail
+        out += "\n" + "\n".join(failures[:10])
+    if finish:
+        out += "\n" + "\n".join(_write_outputs(doc, drawing, True, True, False, 150, ""))
+    return out
 
 
 @tool
@@ -1537,39 +1593,7 @@ def finish(
         file_path: Override the DXF output path.
     """
     doc = _get_drawing(drawing)
-    lines: list[str] = [f"✅ Finished '{drawing}' ({len(doc.modelspace())} entities):"]
-    failures = 0
-    if save:
-        path = _resolve_out(file_path, drawing, "dxf")
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            doc.saveas(str(path))
-            _dirty.discard(drawing)
-            lines.append(f"  DXF → {path}")
-        except Exception as e:
-            failures += 1
-            lines.append(f"  ✗ DXF save failed: {e}")
-    if svg:
-        path = _resolve_out("", drawing, "svg")
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            _render_svg(doc, path)
-            lines.append(f"  SVG → {path}")
-        except Exception as e:
-            failures += 1
-            lines.append(f"  ✗ SVG export failed: {e}")
-    if png:
-        path = _resolve_out("", drawing, "png")
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            _render_png(doc, path, dpi)
-            lines.append(f"  PNG → {path}")
-        except Exception as e:
-            failures += 1
-            lines.append(f"  ✗ PNG export failed: {e}")
-    if failures:
-        lines.append(f"⚠️ {failures} step(s) failed.")
-    return "\n".join(lines)
+    return "\n".join(_write_outputs(doc, drawing, save, svg, png, dpi, file_path))
 
 
 @tool(readonly=True)
@@ -1659,9 +1683,13 @@ def _install_signal_handlers() -> None:
             pass
 
 
-def _warm_matplotlib() -> None:
-    """Build matplotlib's font cache in the background so the first PNG export
-    does not pay the 6–7 s cold-start cost."""
+_warm_done = threading.Event()
+
+
+def _warm_renderers() -> None:
+    """Warm both renderers off the critical path so the first export is cheap:
+    matplotlib's font cache (6–7 s cold) and the SVG backend's first-run setup
+    (~120 ms). Runs on a background daemon thread."""
     try:
         import matplotlib
 
@@ -1669,6 +1697,39 @@ def _warm_matplotlib() -> None:
         from matplotlib import font_manager  # noqa: F401  (triggers cache build)
     except Exception:
         pass
+    try:
+        import tempfile
+        from pathlib import Path as _Path
+
+        doc = ezdxf.new()
+        msp = doc.modelspace()
+        msp.add_line((0, 0), (1, 1))
+        msp.add_text("warm", height=0.2)  # text pulls in the font machinery
+        with tempfile.TemporaryDirectory() as tmp:
+            _render_svg(doc, _Path(tmp) / "warm.svg")
+    except Exception:
+        pass
+    finally:
+        _warm_done.set()
+
+
+def _start_warm() -> None:
+    """Start the background renderer warm-up (also runs for imported servers,
+    benches and tests). AUTOCAD_MCP_WARM=0 disables it."""
+    if os.environ.get("AUTOCAD_MCP_WARM", "1") == "0":
+        _warm_done.set()
+        return
+    # delay a little so the warm-up does not compete with the MCP handshake
+    try:
+        delay = float(os.environ.get("AUTOCAD_MCP_WARM_DELAY", "1.0"))
+    except ValueError:
+        delay = 1.0
+    timer = threading.Timer(max(0.0, delay), _warm_renderers)
+    timer.daemon = True
+    timer.start()
+
+
+_start_warm()
 
 
 # ---------------------------------------------------------------------------
@@ -1677,6 +1738,4 @@ def _warm_matplotlib() -> None:
 
 if __name__ == "__main__":
     _install_signal_handlers()
-    if os.environ.get("AUTOCAD_MCP_WARM", "1") != "0":
-        threading.Thread(target=_warm_matplotlib, daemon=True).start()
     mcp.run()

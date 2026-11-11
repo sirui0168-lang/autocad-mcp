@@ -19,12 +19,15 @@ Every single-entity tool call is a full round trip (model → server → model),
 and that round trip is what makes drawing feel slow. A three-room floor plan
 done entity-by-entity costs ~35 tool calls.
 
-**Do this instead — two calls for a whole drawing:**
+**Do this instead — ONE call for a whole drawing:**
 
 ```text
-apply_ops(drawing="plan", ops=[ ...every wall, door, window, dim, text... ])
-finish(drawing="plan")                     # saves DXF + exports SVG
+apply_ops(drawing="plan", ops=[ ...every wall, door, window, dim, text... ],
+          finish=True)                     # saves DXF + exports SVG too
 ```
+
+Split it into `apply_ops(...)` + `finish(drawing="plan")` only when you want to
+inspect the result before writing files.
 
 - `apply_ops` executes the whole list in one round trip. A bad op is reported
   in the result and the rest still run — you can fix just that op afterwards.

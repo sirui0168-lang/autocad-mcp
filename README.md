@@ -3,11 +3,11 @@
 
 无需安装庞大的 AutoCAD 商业软件，即可通过本 MCP 插件借助 `ezdxf` 引擎，实现完全符合 AutoCAD 2025 / DXF 标准的工程图纸创建、编辑、图层管理、图块调用、尺寸标注与矢量/光栅图像导出。
 
-**v1.1.0 重点：快。** 批量绘图走 `apply_ops`、一次收尾走 `finish`，导出改原生 SVG 渲染器，工具全部移到工作线程——单张平面图从「几十次往返 + 7 秒导出」压到「2 次调用 + 0.1 秒」。
+**v1.2.0 重点：快。** 批量绘图走 `apply_ops`（加 `finish=True` 连存盘导出一起做），导出改原生 SVG 渲染器，工具全部移到工作线程——单张平面图从「几十次往返 + 7 秒导出」压到「**1 次调用 + 0.1 秒**」。
 
 | 场景 | v1.0.0 | v1.1.0 | 提升 |
 | :--- | ---: | ---: | ---: |
-| 三居室平面图（35 次工具往返） | ~35 次调用 | **2 次调用**（`apply_ops` + `finish`） | 17× |
+| 三居室平面图（35 次工具往返） | ~35 次调用 | **1 次调用**（`apply_ops(finish=True)`） | 35× |
 | 首次导出 SVG（冷启动） | 7286 ms | **113 ms** | 65× |
 | 5 万图元图导出 SVG | ~7000 ms | **749 ms** | 9.4× |
 | 导出期间其它工具响应 | 6779 ms（事件循环被阻塞） | **0.5 ms** | 服务器不再假死 |
@@ -121,11 +121,18 @@ pip install -r requirements.txt
 
 > 单图元工具（`draw_line` 等）一次只能画一个对象，每个对象都是一次「模型 → 服务器 → 模型」往返。画一张平面图要几十轮，**慢的不是 Python，是轮次**。
 
-### 两步画完一张图
+### 一步 / 两步画完一张图
 
 ```text
-1) apply_ops(drawing="plan", ops=[ ... 全部图元 ... ])
-2) finish(drawing="plan")            # 保存 DXF + 导出 SVG，一次搞定
+apply_ops(drawing="plan", ops=[ ... 全部图元 ... ], finish=True)
+# 这一次调用就写好了 DXF + SVG，整个平面图只有一次往返
+```
+
+需要分阶段（先看实体再出图）时，也可以拆成两步：
+
+```text
+1) apply_ops(drawing="plan", ops=[ ... ])
+2) finish(drawing="plan")            # 保存 DXF + 导出 SVG
 ```
 
 `apply_ops` 一次可传几十上百个 op；某一条写错只会在结果里报错，不影响其余。
@@ -175,7 +182,7 @@ pip install -r requirements.txt
 ### 一、批量与复合（推荐优先使用）
 | 工具名称 | 功能描述 | 核心参数 |
 | :--- | :--- | :--- |
-| `apply_ops` | **一次调用执行多条绘图操作** | `drawing`, `ops`（对象数组或 JSON 字符串） |
+| `apply_ops` | **一次调用执行多条绘图操作**（`finish=True` 顺带存盘 + 导出 SVG） | `drawing`, `ops`（对象数组或 JSON 字符串）, `finish` |
 | `finish` | **一次收尾：存 DXF + 导出 SVG/PNG** | `drawing`, `save`, `svg`, `png`, `dpi`, `file_path` |
 | `inspect_drawing` | 一次汇总：单位、各类型图元数量、图层、块、包围盒、前 N 个图元 | `drawing`, `max_entities` |
 | `view_drawing` | 渲染并**内联返回图片**，模型可直接查看 | `drawing`, `dpi` |

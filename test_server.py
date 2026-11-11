@@ -35,7 +35,7 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 def main() -> int:
     print("=" * 68)
-    print("AutoCAD MCP Server Self-Test (v1.1.0)")
+    print("AutoCAD MCP Server Self-Test (v1.2.0)")
     print("=" * 68)
 
     out_dir = server._output_dir  # honours AUTOCAD_MCP_OUTPUT
@@ -82,6 +82,13 @@ def main() -> int:
     check("apply_ops continues after error", "1/2 ok" in server.apply_ops(
         "test_run", [{"op": "nope"}, {"op": "line", "x1": 0, "y1": 0, "x2": 1, "y2": 1}]
     ))
+
+    # whole drawing in ONE call: ops + save + SVG
+    onepass = server.apply_ops(
+        "test_run", [{"op": "line", "x1": 0, "y1": 0, "x2": 2, "y2": 2}], finish=True
+    )
+    check("apply_ops(finish=True) saves DXF", "DXF →" in onepass, onepass)
+    check("apply_ops(finish=True) exports SVG", "SVG →" in onepass, onepass)
 
     doc = server._get_drawing("test_run")
     msp = doc.modelspace()

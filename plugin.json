@@ -1,7 +1,7 @@
 {
   "name": "autocad-mcp",
   "description": "AutoCAD DXF drawing MCP server using ezdxf. Batch drawing ops, one-call finish, native SVG export and threaded tools: create, edit, query and export AutoCAD-compatible DXF drawings on macOS without AutoCAD installed.",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
     "创建一个新的 DXF 图纸，画一个 10x8 米的房间平面图（用 apply_ops 一次画完）",

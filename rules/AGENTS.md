@@ -4,7 +4,7 @@ When the user asks to create or edit CAD drawings:
 
 ## Efficiency rules (most important)
 
-- **Draw in batches.** Prefer ONE `apply_ops(drawing, ops=[...])` call over many
+- **Draw in batches.** Prefer ONE `apply_ops(drawing, ops=[...], finish=True)` call over many
   single-entity tools. Each separate tool call is a round trip; a floor plan
   done call-by-call costs dozens of them and feels slow.
 - **Finish in one call.** Use `finish(drawing)` to save the DXF and export the
