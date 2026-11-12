@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "autocad-mcp": {
+      "command": "__PLUGIN_DIR__/.venv/bin/python3",
+      "args": [
+        "__PLUGIN_DIR__/server.py"
+      ],
+      "env": {
+        "AUTOCAD_MCP_OUTPUT": "__OUTPUT_DIR__"
+      }
+    }
+  }
+}

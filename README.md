@@ -33,11 +33,13 @@
 ```text
 autocad-mcp/
 ├── server.py                  # MCP Server 主入口（FastMCP，38 项工具）
-├── test_server.py             # 一键自检（36 项端到端检查）
+├── test_server.py             # 一键自检（44 项端到端检查）
 ├── benchmark.py               # 性能基准（启动、导出、并发、大图）
 ├── requirements.txt           # Python 依赖清单 (ezdxf, pymupdf, mcp)
 ├── plugin.json                # Antigravity / Agent 插件元数据清单
-├── mcp_config.json            # MCP 配置文件示例
+├── install.sh                 # 一键安装：建 venv、装依赖、按真实路径生成 mcp_config.json
+├── mcp_config.example.json    # 配置模板（占位符 __PLUGIN_DIR__ / __OUTPUT_DIR__）
+├── mcp_config.json            # 本机实际配置（由 install.sh 生成，不入库）
 ├── rules/
 │   └── AGENTS.md              # 规范约束（批量调用、图层命名、ACI 颜色、输出路径）
 ├── skills/
@@ -57,15 +59,19 @@ autocad-mcp/
 ### 安装步骤
 
 ```bash
-# 1. 进入插件目录
+git clone git@github.com:sirui0168-lang/autocad-mcp.git
 cd autocad-mcp
+./install.sh                       # venv + 依赖 + mcp_config.json + 客户端接入片段
+```
 
-# 2. 创建并激活虚拟环境（推荐）
-python3 -m venv .venv
-source .venv/bin/activate
+`install.sh` 会创建 `.venv`、装依赖、按本机真实路径生成 `mcp_config.json`（含输出目录），
+最后打印 Codex / Claude Code / DSH / Claude Desktop 的接入命令。
+输出目录默认 `~/Documents/AutoCAD_MCP`，用 `AUTOCAD_MCP_OUTPUT=~/Cad ./install.sh` 可改。
 
-# 3. 安装依赖包
-pip install -r requirements.txt
+手动安装等价于：
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```
 
 > PNG 导出走 **PyMuPDF**：先把图纸渲染成 SVG（ezdxf 原生后端），内联掉 ezdxf 的
@@ -81,7 +87,7 @@ pip install -r requirements.txt
 ## 快速自检与性能基准
 
 ```bash
-# 自检：36 项断言，覆盖图纸/图层/批量绘图/导出/热更新/自动归档
+# 自检：44 项断言，覆盖图纸/图层/批量绘图/导出/热更新/自动归档
 .venv/bin/python3 test_server.py
 
 # 性能基准：启动耗时、批量绘图、5 万图元导出、并发不阻塞
@@ -94,33 +100,69 @@ pip install -r requirements.txt
 - 单图元工具向后兼容（`is_closed` 别名、`save_drawing` 两种参数名）
 - `export_svg` / `export_png` / `view_drawing`（内联图片）/ `finish`
 - 输出目录展开 `~`、`close_drawing` 清理
+- PyMuPDF PNG 后端、`AUTOCAD_MCP_TOOLS=core` 下的工具数（9 vs 38）
 
 ---
 
 ## MCP 客户端接入配置
 
-### 1. Antigravity IDE
-在 `~/.gemini/antigravity/mcp_config.json` 或本项目的 `mcp_config.json` 中配置：
+所有客户端跑的都是同一个 stdio 服务器，只有配置文件位置和语法不同：
 
-```json
-{
-  "mcpServers": {
-    "autocad-mcp": {
-      "command": "/绝对路径/autocad-mcp/.venv/bin/python3",
-      "args": ["/绝对路径/autocad-mcp/server.py"],
-      "env": {
-        "AUTOCAD_MCP_OUTPUT": "~/Documents/AutoCAD_MCP",
-        "AUTOCAD_MCP_LOG": "WARNING",
-        "AUTOCAD_MCP_TOOLS": "full",
-        "AUTOCAD_MCP_PNG": "auto"
-      }
-    }
-  }
-}
+```
+command: <插件目录>/.venv/bin/python3
+args:    ["<插件目录>/server.py"]
+env:     AUTOCAD_MCP_OUTPUT=<输出目录>   # 可选
 ```
 
-### 2. Claude Desktop
-在 `~/Library/Application Support/Claude/claude_desktop_config.json` 中添加同上结构即可。
+`./install.sh` 跑完会把这四段原样打印出来（路径已填好）。
+
+### 1. Codex
+
+```bash
+codex mcp add autocad-mcp \
+  --env AUTOCAD_MCP_OUTPUT="$HOME/Documents/AutoCAD_MCP" \
+  -- "$PWD/.venv/bin/python3" "$PWD/server.py"
+codex mcp list            # autocad-mcp 应为 enabled
+```
+
+### 2. Claude Code
+
+```bash
+claude mcp add autocad-mcp \
+  --env AUTOCAD_MCP_OUTPUT="$HOME/Documents/AutoCAD_MCP" \
+  -- "$PWD/.venv/bin/python3" "$PWD/server.py"
+```
+
+### 3. DSH（DeepSeek Harness）
+
+写进 profile 补丁（`~/.dsh/profiles/desktop/cordis.patch.yml`）：
+
+```yaml
+- insert:
+    - id: autocad-mcp
+      name: "@deepseek-ai/dsh-mcp-client"
+      config:
+        serverName: autocad-mcp
+        transport: stdio
+        command: "/绝对路径/autocad-mcp/.venv/bin/python3"
+        args: ["/绝对路径/autocad-mcp/server.py"]
+        env:
+          AUTOCAD_MCP_OUTPUT: "/Users/you/Documents/AutoCAD_MCP"
+        toolCallTimeoutMs: 180000
+```
+
+### 4. Antigravity / Gemini 插件
+
+把 `./install.sh` 生成的 `mcp_config.json`（或 `mcp_config.example.json` 填好路径）放到
+`~/.gemini/config/plugins/autocad-mcp/mcp_config.json`，重启 IDE 生效。
+
+### 5. Claude Desktop / Cursor
+
+在 `~/Library/Application Support/Claude/claude_desktop_config.json` 的 `mcpServers`
+里合并 `mcp_config.json` 的内容。
+
+> 改了 `server.py` 之后：Codex / Claude Code / DSH 重启对应会话即可（每次会话重新拉起进程）；
+> Antigravity 的 MCP 进程由 IDE 托管并跨会话复用，必须**重启 IDE**。
 
 ---
 
