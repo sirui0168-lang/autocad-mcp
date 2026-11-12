@@ -1,8 +1,18 @@
-# AutoCAD MCP Server & Plugin
-> **专为 macOS（Apple Silicon M 系列及 Intel）及跨平台优化的 AutoCAD / DXF 矢量绘图 MCP 插件**
+# autocad-mcp ｜ AutoCAD / DXF 绘图 MCP 服务器（macOS 优先）
 
-无需安装庞大的 AutoCAD 商业软件，即可通过本 MCP 插件借助 `ezdxf` 引擎，实现完全符合 AutoCAD 2025 / DXF 标准的工程图纸创建、编辑、图层管理、图块调用、尺寸标注与矢量/光栅图像导出。
+> 跨平台，但**以 macOS 为主要开发与验证平台**（Apple Silicon 上实测；Intel 同样可用）。
 
+无需安装庞大的 AutoCAD 商业软件，即可通过本 MCP 服务器借助 `ezdxf` 引擎，实现符合 AutoCAD 2025 / DXF 标准的图纸创建、编辑、图层管理、图块调用、尺寸标注与矢量/光栅导出。
+
+### 平台支持
+
+| 平台 | 状态 | 说明 |
+| :--- | :--- | :--- |
+| **macOS 14+（Apple Silicon / Intel）** | ✅ **主要支持平台** | 本仓库在这台 Mac 上开发并实测：Antigravity、Codex、DSH、Claude 均已打通 |
+| Linux | ✅ 可用 | 服务端是纯 Python + stdio，`install.sh` 只需 bash |
+| Windows | ⚠️ 未验证 | 建议 WSL / Git Bash 跑 `install.sh`；服务端本身无平台依赖 |
+
+**v1.3.0 重点：更省、更快。** 新增 `AUTOCAD_MCP_TOOLS=core` 精简模式（38 → 9 个工具，`tools/list` 从 13,686 字符降到 2,204，每轮省约 2.9K tokens）；PNG 改走 PyMuPDF（11.7 MB 的管网图 23.2 s → 6.7 s）。
 **v1.2.0 重点：快。** 批量绘图走 `apply_ops`（加 `finish=True` 连存盘导出一起做），导出改原生 SVG 渲染器，工具全部移到工作线程——单张平面图从「几十次往返 + 7 秒导出」压到「**1 次调用 + 0.1 秒**」。
 
 | 场景 | v1.0.0 | v1.1.0 | 提升 |
@@ -53,8 +63,8 @@ autocad-mcp/
 
 ## 环境依赖与安装
 
-- **操作系统**：macOS (推荐 Apple Silicon M1/M2/M3/M4, 也支持 Intel)、Linux、Windows
-- **Python 版本**：Python 3.10 ~ 3.12（推荐 Homebrew Python 3.12）
+- **操作系统**：见上方「平台支持」——macOS 为主支持（Apple Silicon / Intel），Linux 可用，Windows 需 WSL
+- **Python 版本**：Python 3.10 ~ 3.12（macOS 推荐 Homebrew Python 3.12）
 
 ### 安装步骤
 
@@ -301,6 +311,16 @@ apply_ops(drawing="plan", ops=[ ... 全部图元 ... ], finish=True)
 | :--- | :--- | :--- |
 | `export_svg` | 导出矢量图 (.svg)，**原生渲染器，不需要 matplotlib** | `drawing`, `file_path` |
 | `export_png` | 导出光栅图 (.png)：SVG 经 PyMuPDF 光栅化，未装时回退 matplotlib | `drawing`, `file_path`, `dpi` |
+
+---
+
+## macOS 使用提示
+
+- **Apple Silicon 原生**：`ezdxf` / `pymupdf` 都有 arm64 wheel，`install.sh` 直接装即可，不需要 Rosetta。
+- **系统 Python 别用**：macOS 自带的 `/usr/bin/python3` 缺 venv 的 pip 更新，`install.sh` 会优先挑 Homebrew 的 `python3`。
+- **Gatekeeper / 网络**：首次 `pip install pymupdf` 要下 ~65 MB wheel；局域网慢时约 8 分钟，属正常。
+- **输出目录**：默认 `~/Documents/AutoCAD_MCP`；macOS 首次写入「文稿」目录可能弹一次磁盘访问授权。
+- **MCP 客户端**：Antigravity 的 MCP 进程由 IDE 托管并跨会话复用，改完 `server.py` 必须**重启 IDE**；Codex / Claude Code / DSH 重启会话即可。
 
 ---
 
